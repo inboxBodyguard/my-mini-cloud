@@ -2,8 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Docker CLI and other dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
+    git \
     docker.io \
     && rm -rf /var/lib/apt/lists/*
 
@@ -12,7 +13,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Expose the API and dashboard port
+# Create directories
+RUN mkdir -p /tmp/builds /app/data
+
 EXPOSE 8000
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
