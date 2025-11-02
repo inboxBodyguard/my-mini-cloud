@@ -368,6 +368,40 @@ app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="das
 async def serve_dashboard():
     return FileResponse('dashboard/index.html')
 
+
+@app.get("/api/apps/{app_id}/stats")
+async def get_app_stats(app_id: str, current_user: dict = Depends(get_current_user)):
+    """Get resource usage statistics for an app"""
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    
+    try:
+        container = docker_client.containers.get(apps_db[app_id]["container_id"])
+        stats = container.stats(stream=False)
+        
+        # Parse Docker stats
+        cpu_stats = stats["cpu_stats"]
+        memory_stats = stats["memory_stats"]
+        
+        return {
+            "cpu_usage": calculate_cpu_percent(cpu_stats),
+            "memory_usage": memory_stats.get("usage", 0),
+            "memory_limit": memory_stats.get("limit", 0),
+            "network_io": stats["networks"],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get stats: {str(e)}")
+
+def calculate_cpu_percent(cpu_stats):
+    """Calculate CPU percentage from Docker stats"""
+    cpu_delta = cpu_stats["cpu_usage"]["total_usage"] - cpu_stats["precpu_usage"]["total_usage"]
+    system_delta = cpu_stats["system_cpu_usage"] - cpu_stats["precpu_usage"]["system_cpu_usage"]
+    
+    if system_delta > 0 and cpu_delta > 0:
+        return (cpu_delta / system_delta) * 100.0
+    return 0.0
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
