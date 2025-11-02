@@ -1,4 +1,3 @@
-# main.py
 import os
 import uuid
 import json
@@ -7,7 +6,7 @@ import subprocess
 from typing import Dict, List, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -62,8 +61,6 @@ class AppStatus(BaseModel):
 async def startup():
     """Initialize platform on startup"""
     print("🚀 Starting Mini Cloud Platform...")
-    
-    # Ensure Docker network exists
     try:
         docker_client.networks.get(CONFIG["docker_network"])
     except docker.errors.NotFound:
@@ -90,11 +87,11 @@ async def deploy_app(
     # Generate subdomain
     if CONFIG["domain"] == "localhost":
         url = f"http://localhost:{port}"
+        subdomain = f"localhost:{port}"
     else:
         subdomain = deployment.name.lower().replace(" ", "-")
         url = f"https://{subdomain}.{CONFIG['domain']}"
 
-    # Create app record
     app_data = {
         "id": app_id,
         "name": deployment.name,
@@ -104,13 +101,12 @@ async def deploy_app(
         "git_url": deployment.git_url,
         "environment_variables": deployment.environment_variables,
         "created_at": datetime.now().isoformat(),
-        "container_id": None
+        "container_id": None,
+        "subdomain": subdomain
     }
     
     apps_db[app_id] = app_data
-    
-    # Start deployment in background
-    background_tasks.add_task(deploy_app_background, app_id, deployment)
+    background_tasks.add_task(deploy_app_background, app_id, deployment, subdomain)
     
     return {
         "app_id": app_id, 
@@ -119,33 +115,65 @@ async def deploy_app(
         "message": "Deployment started"
     }
 
-async def deploy_app_background(app_id: str, deployment: DeploymentRequest):
-    """Background task to handle app deployment"""
+async def deploy_app_background(app_id: str, deployment: DeploymentRequest, subdomain: str):
     try:
         app_data = apps_db[app_id]
         print(f"🛠️ Building app: {app_data['name']} ({app_id})")
-        
-        # For Git deployment
         if deployment.git_url:
-            await build_from_git(app_id, deployment)
+            await build_from_git(app_id, deployment, subdomain)
         else:
             raise HTTPException(400, "Only Git deployment supported in this version")
-            
     except Exception as e:
         apps_db[app_id]["status"] = "error"
         apps_db[app_id]["error"] = str(e)
         print(f"❌ Deployment failed for {app_id}: {e}")
 
-async def build_from_git(app_id: str, deployment: DeploymentRequest):
-    """Build and deploy from Git repository"""
-    app_data = apps_db[app_id]
+def create_app_container(app_id: str, image_tag: str, environment_vars: dict, port: int, subdomain: str):
+    """Create container with SSL labels"""
     
+    # SSL labels for Traefik
+    labels = {
+        "traefik.enable": "true",
+        f"traefik.http.routers.app-{app_id}.rule": f"Host(`{subdomain}.{CONFIG['domain']}`)",
+        f"traefik.http.routers.app-{app_id}.entrypoints": "websecure",
+        f"traefik.http.routers.app-{app_id}.tls.certresolver": "myresolver",
+        f"traefik.http.services.app-{app_id}.loadbalancer.server.port": str(port)
+    }
+    
+    # Add resource limits for production
+    resource_limits = {
+        "memory": "512M",
+        "memory_reservation": "256M",
+        "nano_cpus": 500000000,
+        "cpu_period": 100000,
+        "cpu_quota": 50000,
+    }
+
+    security_opt = ["no-new-privileges:true"]
+
+    container = docker_client.containers.run(
+        image_tag,
+        detach=True,
+        name=f"app-{app_id}",
+        network=CONFIG["docker_network"],
+        environment=environment_vars,
+        labels=labels,
+        ports={f"{port}/tcp": port} if CONFIG["domain"] == "localhost" else {},
+        mem_limit=resource_limits["memory"],
+        mem_reservation=resource_limits["memory_reservation"],
+        cpu_period=resource_limits["cpu_period"],
+        cpu_quota=resource_limits["cpu_quota"],
+        security_opt=security_opt,
+        restart_policy={"Name": "on-failure", "MaximumRetryCount": 3},
+    )
+    return container
+
+async def build_from_git(app_id: str, deployment: DeploymentRequest, subdomain: str):
+    app_data = apps_db[app_id]
     try:
-        # Create build directory
         build_path = f"/tmp/builds/{app_id}"
         os.makedirs(build_path, exist_ok=True)
         
-        # Clone repository
         print(f"📥 Cloning {deployment.git_url}...")
         result = subprocess.run(
             ["git", "clone", deployment.git_url, build_path],
@@ -155,56 +183,26 @@ async def build_from_git(app_id: str, deployment: DeploymentRequest):
         if result.returncode != 0:
             raise Exception(f"Git clone failed: {result.stderr}")
         
-        # Check for Dockerfile
         dockerfile_path = os.path.join(build_path, "Dockerfile")
         if not os.path.exists(dockerfile_path):
-            # Generate simple Dockerfile for Node.js/Python apps
             await generate_dockerfile(build_path)
         
-        # Build Docker image
         image_tag = f"mini-cloud-app-{app_id}:latest"
         print(f"🐳 Building Docker image: {image_tag}")
+        image, logs = docker_client.images.build(path=build_path, tag=image_tag, rm=True)
         
-        image, logs = docker_client.images.build(
-            path=build_path,
-            tag=image_tag,
-            rm=True
-        )
+        environment_vars = {**app_data["environment_variables"], "PORT": str(app_data["port"])}
+        container = create_app_container(app_id, image_tag, environment_vars, app_data["port"], subdomain)
         
-        # Run container
-        container_name = f"app-{app_id}"
-        environment_vars = {
-            **app_data["environment_variables"],
-            "PORT": str(app_data["port"])
-        }
-        
-        container: Container = docker_client.containers.run(
-            image_tag,
-            detach=True,
-            name=container_name,
-            network=CONFIG["docker_network"],
-            ports={f"{app_data['port']}/tcp": app_data['port']},
-            environment=environment_vars,
-            labels={
-                "mini-cloud.app-id": app_id,
-                "mini-cloud.app-name": app_data["name"]
-            }
-        )
-        
-        # Update app status
         apps_db[app_id]["status"] = "running"
         apps_db[app_id]["container_id"] = container.id
-        
         print(f"✅ Successfully deployed {app_data['name']} at {app_data['url']}")
-        
     except Exception as e:
         apps_db[app_id]["status"] = "error"
         apps_db[app_id]["error"] = str(e)
         raise
 
 async def generate_dockerfile(build_path: str):
-    """Generate a Dockerfile for common app types"""
-    # Check for package.json (Node.js) or requirements.txt (Python)
     if os.path.exists(os.path.join(build_path, "package.json")):
         dockerfile_content = """
 FROM node:18-alpine
@@ -231,32 +229,26 @@ FROM nginx:alpine
 COPY . /usr/share/nginx/html
 EXPOSE 80
 """
-    
     with open(os.path.join(build_path, "Dockerfile"), "w") as f:
         f.write(dockerfile_content)
 
 @app.get("/api/apps", response_model=List[AppStatus])
 async def list_apps():
-    """Get all deployed applications"""
     return [AppStatus(**app) for app in apps_db.values()]
 
 @app.get("/api/apps/{app_id}", response_model=AppStatus)
 async def get_app(app_id: str):
-    """Get specific app details"""
     if app_id not in apps_db:
         raise HTTPException(404, "App not found")
     return AppStatus(**apps_db[app_id])
 
 @app.post("/api/apps/{app_id}/start")
 async def start_app(app_id: str):
-    """Start a stopped application"""
     if app_id not in apps_db:
         raise HTTPException(404, "App not found")
-    
     app_data = apps_db[app_id]
     if not app_data["container_id"]:
         raise HTTPException(400, "App not deployed properly")
-    
     try:
         container = docker_client.containers.get(app_data["container_id"])
         container.start()
@@ -267,14 +259,11 @@ async def start_app(app_id: str):
 
 @app.post("/api/apps/{app_id}/stop")
 async def stop_app(app_id: str):
-    """Stop a running application"""
     if app_id not in apps_db:
         raise HTTPException(404, "App not found")
-    
     app_data = apps_db[app_id]
     if not app_data["container_id"]:
         raise HTTPException(400, "App not deployed properly")
-    
     try:
         container = docker_client.containers.get(app_data["container_id"])
         container.stop()
@@ -285,14 +274,11 @@ async def stop_app(app_id: str):
 
 @app.post("/api/apps/{app_id}/restart")
 async def restart_app(app_id: str):
-    """Restart an application"""
     if app_id not in apps_db:
         raise HTTPException(404, "App not found")
-    
     app_data = apps_db[app_id]
     if not app_data["container_id"]:
         raise HTTPException(400, "App not deployed properly")
-    
     try:
         container = docker_client.containers.get(app_data["container_id"])
         container.restart()
@@ -303,43 +289,31 @@ async def restart_app(app_id: str):
 
 @app.delete("/api/apps/{app_id}")
 async def delete_app(app_id: str):
-    """Delete an application"""
     if app_id not in apps_db:
         raise HTTPException(404, "App not found")
-    
     app_data = apps_db[app_id]
-    
     try:
-        # Stop and remove container
         if app_data["container_id"]:
             container = docker_client.containers.get(app_data["container_id"])
             container.stop()
             container.remove()
-        
-        # Remove image
         image_tag = f"mini-cloud-app-{app_id}:latest"
         try:
             docker_client.images.remove(image_tag)
         except:
-            pass  # Image might not exist
-        
-        # Remove from database
+            pass
         del apps_db[app_id]
-        
         return {"status": "success", "message": "App deleted"}
     except Exception as e:
         raise HTTPException(500, f"Failed to delete app: {str(e)}")
 
 @app.get("/api/apps/{app_id}/logs")
 async def get_app_logs(app_id: str, lines: int = 100):
-    """Get application logs"""
     if app_id not in apps_db:
         raise HTTPException(404, "App not found")
-    
     app_data = apps_db[app_id]
     if not app_data["container_id"]:
         raise HTTPException(400, "App not deployed properly")
-    
     try:
         container = docker_client.containers.get(app_data["container_id"])
         logs = container.logs(tail=lines).decode('utf-8')
@@ -349,40 +323,31 @@ async def get_app_logs(app_id: str, lines: int = 100):
 
 @app.get("/api/stats")
 async def get_platform_stats():
-    """Get platform statistics"""
     total_apps = len(apps_db)
     running_apps = len([app for app in apps_db.values() if app["status"] == "running"])
-    
     return {
         "total_apps": total_apps,
         "running_apps": running_apps,
         "stopped_apps": total_apps - running_apps,
         "domain": CONFIG["domain"],
-        "uptime": "0"  # You'd track this in production
+        "uptime": "0"
     }
 
-# Serve static files for dashboard
 app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="dashboard")
 
 @app.get("/dashboard")
 async def serve_dashboard():
     return FileResponse('dashboard/index.html')
 
-
 @app.get("/api/apps/{app_id}/stats")
-async def get_app_stats(app_id: str, current_user: dict = Depends(get_current_user)):
-    """Get resource usage statistics for an app"""
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+async def get_app_stats(app_id: str):
+    if app_id not in apps_db:
         raise HTTPException(404, "App not found")
-    
     try:
         container = docker_client.containers.get(apps_db[app_id]["container_id"])
         stats = container.stats(stream=False)
-        
-        # Parse Docker stats
         cpu_stats = stats["cpu_stats"]
         memory_stats = stats["memory_stats"]
-        
         return {
             "cpu_usage": calculate_cpu_percent(cpu_stats),
             "memory_usage": memory_stats.get("usage", 0),
@@ -394,10 +359,8 @@ async def get_app_stats(app_id: str, current_user: dict = Depends(get_current_us
         raise HTTPException(500, f"Failed to get stats: {str(e)}")
 
 def calculate_cpu_percent(cpu_stats):
-    """Calculate CPU percentage from Docker stats"""
     cpu_delta = cpu_stats["cpu_usage"]["total_usage"] - cpu_stats["precpu_usage"]["total_usage"]
     system_delta = cpu_stats["system_cpu_usage"] - cpu_stats["precpu_usage"]["system_cpu_usage"]
-    
     if system_delta > 0 and cpu_delta > 0:
         return (cpu_delta / system_delta) * 100.0
     return 0.0
