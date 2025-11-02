@@ -227,7 +227,7 @@ def create_app_container(app_id: str, image_tag: str, environment_vars: dict, po
         network=CONFIG["docker_network"],
         environment=environment_vars,
         labels=labels,
-        ports={f"{port}/tcp": port} if CONFIG["domain"] == "domain"] == "localhostlocalhost"" else {},
+        ports = {f"{port}/tcp": port} if CONFIG["domain"] == "localhost" else {}
         mem else {},
         mem_limit=resource_limits["_limit=resource_limits["memory"],
         mem_reservation=resource_limits["memory_reservation"],
