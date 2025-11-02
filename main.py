@@ -365,6 +365,52 @@ def calculate_cpu_percent(cpu_stats):
         return (cpu_delta / system_delta) * 100.0
     return 0.0
 
+# -------------------------
+# 🔒 Admin Backup Endpoints
+# -------------------------
+@app.post("/api/admin/backup")
+async def trigger_backup(
+    background_tasks: BackgroundTasks
+):
+    """Trigger manual backup (admin only)"""
+    background_tasks.add_task(perform_full_backup)
+    return {"status": "success", "message": "Backup started"}
+
+@app.get("/api/admin/backups")
+async def list_backups():
+    """List available backups"""
+    backup_files = []
+    backup_dir = "/app/backups"
+    
+    if os.path.exists(backup_dir):
+        for filename in os.listdir(backup_dir):
+            filepath = os.path.join(backup_dir, filename)
+            if os.path.isfile(filepath):
+                backup_files.append({
+                    "name": filename,
+                    "size": os.path.getsize(filepath),
+                    "created": datetime.fromtimestamp(os.path.getctime(filepath)).isoformat()
+                })
+    
+    return {"backups": backup_files}
+
+
+# Background backup logic
+def perform_full_backup():
+    """Perform full platform backup"""
+    os.makedirs("/app/backups", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = f"/app/backups/backup_{timestamp}.tar.gz"
+    
+    try:
+        subprocess.run(
+            ["tar", "-czf", backup_path, "/app/data", "/tmp/builds"],
+            check=True
+        )
+        print(f"✅ Backup created: {backup_path}")
+    except Exception as e:
+        print(f"❌ Backup failed: {e}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
