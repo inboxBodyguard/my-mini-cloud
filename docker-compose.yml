@@ -1,19 +1,22 @@
 version: '3.8'
 
 services:
-  cloud-platform:
+  # Main platform API
+  platform:
     build: .
     ports:
       - "8000:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./app-data:/app/data
+      - ./data:/app/data
+      - ./dashboard:/app/dashboard
     environment:
-      - PLATFORM_DOMAIN=platform.local
+      - PLATFORM_DOMAIN=localhost
       - DOCKER_HOST=unix:///var/run/docker.sock
-    depends_on:
-      - traefik
+    networks:
+      - mini-cloud-network
 
+  # Reverse proxy for production
   traefik:
     image: traefik:v2.10
     command:
@@ -25,9 +28,11 @@ services:
       - "8080:8080"  # Traefik dashboard
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - mini-cloud-network
 
-  # Example database for production (optional)
-  database:
+  # Database for production (optional)
+  postgres:
     image: postgres:15
     environment:
       POSTGRES_DB: cloudplatform
@@ -35,6 +40,12 @@ services:
       POSTGRES_PASSWORD: password
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - mini-cloud-network
+
+networks:
+  mini-cloud-network:
+    driver: bridge
 
 volumes:
   postgres_data:
