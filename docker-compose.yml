@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  cloud-platform:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./app-data:/app/data
+    environment:
+      - PLATFORM_DOMAIN=platform.local
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    depends_on:
+      - traefik
+
+  traefik:
+    image: traefik:v2.10
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --entrypoints.web.address=:80
+    ports:
+      - "80:80"
+      - "8080:8080"  # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Example database for production (optional)
+  database:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: cloudplatform
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+  app-data:
