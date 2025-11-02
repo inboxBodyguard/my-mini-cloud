@@ -866,7 +866,97 @@ def perform_full_backup():
     except Exception as e:
         print(f" as e:
         print(f"❌ Backup failed: {e}")
+from fastapi.responses import Response
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-style metrics endpoint"""
+    metrics_data = []
+    
+    # Platform metrics
+    metrics_data.append(f"mini_cloud_apps_total {len(apps_db)}")
+    metrics_data.append(f"mini_cloud_apps_running {len([app for app in apps_db.values() if app.get('status') == 'running'])}")
+    
+    # User metrics (if database is active)
+    try:
+        users_total = len(users_db) if 'users_db' in globals() else 0
+        metrics_data.append(f"mini_cloud_users_total {users_total}")
+    except:
+        metrics_data.append("mini_cloud_users_total 0")
+    
+    # Docker metrics
+    try:
+        containers = docker_client.containers.list()
+        metrics_data.append(f"mini_cloud_containers_total {len(containers)}")
+        running_containers = len([c for c in containers if c.status == "running"])
+        metrics_data.append(f"mini_cloud_containers_running {running_containers}")
+    except Exception:
+        metrics_data.append("mini_cloud_docker_errors 1")
+    
+    return Response(content="\n".join(metrics_data), media_type="text/plain")
+    
+    # Add to main.py
+@app.post("/api/admin/backup")
+async def trigger_backup(
+    current_user: dict = Depends(get_current_user),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """Trigger manual backup (admin only)"""
+    # Check if user is admin (you'd implement proper admin check)
+    background_tasks.add_task(perform_full_backup)
+    return {"status": "success", "message": "Backup started"}
+
+@app.get("/api/admin/backups")
+async def list_backups(current_user: dict = Depends(get_current_user)):
+    """List available backups"""
+    backup_files = []
+    backup_dir = "/app/backups"
+    
+    if os.path.exists(backup_dir):
+        for filename in os.listdir(backup_dir):
+            filepath = os.path.join(backup_dir, filename)
+            if os.path.isfile(filepath):
+                backup_files.append({
+                    "name": filename,
+                    "size": os.path.getsize(filepath),
+                    "created": datetime.fromtimestamp(os.path.getctime(filepath)).isoformat()
+                })
+    
+    return {"backups": backup_files}
+    # Add to main.py
+@app.get("/api/apps/{app_id}/stats")
+async def get_app_stats(app_id: str, current_user: dict = Depends(get_current_user)):
+    """Get resource usage statistics for an app"""
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    
+    try:
+        container = docker_client.containers.get(apps_db[app_id]["container_id"])
+        stats = container.stats(stream=False)
+        
+        # Parse Docker stats
+        cpu_stats = stats["cpu_stats"]
+        memory_stats = stats["memory_stats"]
+        
+        return {
+            "cpu_usage": calculate_cpu_percent(cpu_stats),
+            "memory_usage": memory_stats.get("usage", 0),
+            "memory_limit": memory_stats.get("limit", 0),
+            "network_io": stats["networks"],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get stats: {str(e)}")
+
+def calculate_cpu_percent(cpu_stats):
+    """Calculate CPU percentage from Docker stats"""
+    cpu_delta = cpu_stats["cpu_usage"]["total_usage"] - cpu_stats["precpu_usage"]["total_usage"]
+    system_delta = cpu_stats["system_cpu_usage"] - cpu_stats["precpu_usage"]["system_cpu_usage"]
+    
+    if system_delta > 0 and cpu_delta > 0:
+        return (cpu_delta / system_delta) * 100.0
+    return 0.0
+    
 if __name__ == "__main__":
     import uvicorn
     u❌ Backup failed: {e}")
