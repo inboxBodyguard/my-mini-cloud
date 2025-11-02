@@ -1,4 +1,3 @@
-# backup.py
 import os
 import subprocess
 import tarfile
