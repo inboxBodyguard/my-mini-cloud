@@ -64,6 +64,11 @@
             max-height: 300px;
             overflow-y: auto;
         }
+        .metric { text-align: center; padding: 1rem; background: #2d3748; border-radius: 8px; }
+        .metric-value { font-size: 2rem; font-weight: bold; color: #4299e1; }
+        .metric-label { color: #a0aec0; font-size: 0.9rem; }
+        .health-healthy { color: #48bb78; }
+        .health-unhealthy { color: #e53e3e; }
     </style>
 </head>
 <body>
@@ -73,12 +78,15 @@
         newApp: { name: '', git_url: '' },
         showDeployForm: false,
         selectedApp: null,
-        logs: ''
+        logs: '',
+        loadAppHealth,
+        loadApps,
+        loadStats
     }" 
     x-init="
-        await loadApps();
-        await loadStats();
-        setInterval(() => loadApps(), 5000);
+        await loadApps.call(this);
+        await loadStats.call(this);
+        setInterval(() => loadApps.call(this), 5000);
     ">
         <!-- Header -->
         <div class="header">
@@ -86,6 +94,25 @@
             <p>Deploy and manage your applications</p>
             <div style="margin-top: 1rem;">
                 <span>📊 Apps: <span x-text="stats.running_apps || 0"></span> running / <span x-text="stats.total_apps || 0"></span> total</span>
+            </div>
+        </div>
+
+        <!-- Monitoring Section -->
+        <div class="card">
+            <h3>📊 Platform Monitoring</h3>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+                <div class="metric">
+                    <div class="metric-value" x-text="stats.total_apps || 0"></div>
+                    <div class="metric-label">Total Apps</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" x-text="stats.running_apps || 0"></div>
+                    <div class="metric-label">Running Apps</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" x-text="stats.healthy_apps || 0"></div>
+                    <div class="metric-label">Healthy Apps</div>
+                </div>
             </div>
         </div>
 
@@ -122,6 +149,8 @@
                             <p>
                                 Status: 
                                 <span :class="'status-' + app.status" x-text="app.status.toUpperCase()"></span>
+                                <span x-show="app.health" :class="'health-' + app.health.status" 
+                                      x-text="'(' + app.health.status + ')'"></span>
                             </p>
                         </div>
                         <div style="display: flex; flex-direction: column; gap: 5px;">
@@ -155,16 +184,32 @@
     </div>
 
     <script>
+        function loadAppHealth() {
+            this.apps.forEach(app => {
+                fetch(`/api/apps/${app.id}/health`)
+                    .then(r => r.json())
+                    .then(health => { app.health = health; });
+            });
+        }
+
         function loadApps() {
             return fetch('/api/apps')
                 .then(r => r.json())
-                .then(data => { this.apps = data; });
+                .then(data => { 
+                    this.apps = data;
+                    this.loadAppHealth();
+                });
         }
 
         function loadStats() {
             return fetch('/api/stats')
                 .then(r => r.json())
-                .then(data => { this.stats = data; });
+                .then(data => { 
+                    this.stats = data;
+                    this.stats.healthy_apps = this.apps.filter(app => 
+                        app.health && app.health.status === 'healthy'
+                    ).length;
+                });
         }
 
         function deployApp() {
