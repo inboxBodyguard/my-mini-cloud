@@ -1,7 +1,6 @@
 version: '3.8'
 
 services:
-  # Main platform API
   platform:
     build: .
     ports:
@@ -11,27 +10,38 @@ services:
       - ./data:/app/data
       - ./dashboard:/app/dashboard
     environment:
-      - PLATFORM_DOMAIN=localhost
+      - PLATFORM_DOMAIN=your-domain.com
       - DOCKER_HOST=unix:///var/run/docker.sock
+      - DATABASE_URL=postgresql://admin:password@postgres:5432/cloudplatform
+      - SECRET_KEY=your-secret-key-change-in-production
     networks:
       - mini-cloud-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.platform.rule=Host(`platform.your-domain.com`)"
+      - "traefik.http.routers.platform.entrypoints=websecure"
+      - "traefik.http.routers.platform.tls.certresolver=myresolver"
 
-  # Reverse proxy for production
   traefik:
     image: traefik:v2.10
     command:
       - --api.insecure=true
       - --providers.docker=true
       - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.myresolver.acme.email=your-email@your-domain.com
+      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web
     ports:
       - "80:80"
-      - "8080:8080"  # Traefik dashboard
+      - "443:443"
+      - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./letsencrypt:/letsencrypt
     networks:
       - mini-cloud-network
 
-  # Database for production (optional)
   postgres:
     image: postgres:15
     environment:
@@ -40,6 +50,7 @@ services:
       POSTGRES_PASSWORD: password
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
     networks:
       - mini-cloud-network
 
