@@ -21,6 +21,7 @@ services:
       - "traefik.http.routers.platform.rule=Host(`platform.your-domain.com`)"
       - "traefik.http.routers.platform.entrypoints=websecure"
       - "traefik.http.routers.platform.tls.certresolver=myresolver"
+    restart: unless-stopped  # ✅ Added restart policy
 
   traefik:
     image: traefik:v2.10
@@ -41,6 +42,7 @@ services:
       - ./letsencrypt:/letsencrypt
     networks:
       - mini-cloud-network
+    restart: unless-stopped  # ✅ Added restart policy
 
   postgres:
     image: postgres:15
@@ -51,6 +53,16 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backups:/backups
+    networks:
+      - mini-cloud-network
+    restart: unless-stopped  # ✅ Added restart policy
+
+  watchtower:  # ✅ Added watchtower for automatic container updates
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --cleanup --interval 300
     networks:
       - mini-cloud-network
 
