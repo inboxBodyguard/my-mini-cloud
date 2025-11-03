@@ -1,55 +1,523 @@
 import os
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+import uuid
+import json
+import asyncio
+import subprocess
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable not set")
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import docker
+from docker.models.containers import Container
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# Database imports
+from sqlalchemy.orm import Session
+from database import get_db, User, App, APIKey
 
-class User(Base):
-    __tablename__ = "users"
-    
-    id = Column(String, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+# Configuration
+CONFIG = {
+    "domain": os.getenv("PLATFORM_DOMAIN", "localhost"),
+    "docker_network": "mini-cloud-network",
+    "data_volume": "mini-cloud-data",
+    "port_range_start": 10000
+}
 
-class App(Base):
-    __tablename__ = "apps"
-    
-    id = Column(String, primary_key=True, index=True)
-    name = Column(String, index=True)
-    status = Column(String, default="building")
-    url = Column(String)
-    port = Column(Integer)
-    git_url = Column(String, nullable=True)
-    environment_variables = Column(Text)
-    container_id = Column(String, nullable=True)
-    user_id = Column(String, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+app = FastAPI(title="Mini Cloud Platform", version="1.0.0")
 
-class APIKey(Base):
-    __tablename__ = "api_keys"
-    
-    key = Column(String, primary_key=True)
-    user_id = Column(String, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    is_active = Column(Boolean, default=True)
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+# Docker client
+docker_client = docker.from_env()
 
-def get_db():
-    db = SessionLocal()
+# In-memory storage (fallback during transition)
+apps_db: Dict[str, dict] = {}
+deployments_db: Dict[str, dict] = {}
+
+# Pydantic models
+class DeploymentRequest(BaseModel):
+    name: str
+    git_url: Optional[str] = None
+    environment_variables: Dict[str, str] = {}
+    port: Optional[int] = None
+
+class AppStatus(BaseModel):
+    id: str
+    name: str
+    status: str
+    url: str
+    port: int
+    created_at: str
+    git_url: Optional[str] = None
+    container_id: Optional[str] = None
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+@app.on_event("startup")
+async def startup():
+    print("🚀 Starting Mini Cloud Platform...")
     try:
-        yield db
-    finally:
-        db.close()
+        docker_client.networks.get(CONFIG["docker_network"])
+    except docker.errors.NotFound:
+        docker_client.networks.create(
+            CONFIG["docker_network"], 
+            driver="bridge",
+            attachable=True
+        )
+        print(f"✅ Created Docker network: {CONFIG['docker_network']}")
+
+@app.get("/")
+async def root():
+    return {"message": "Mini Cloud Platform API", "version": "1.0.0"}
+
+@app.post("/api/auth/register", response_model=Token)
+async def register(user: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.email == user.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    user_id = str(uuid.uuid4())
+    hashed_password = user.password + "_hashed"
+    
+    db_user = User(
+        id=user_id,
+        email=user.email,
+        hashed_password=hashed_password
+    )
+    db.add(db_user)
+    db.commit()
+    
+    access_token = f"token_{user_id}"
+    return {"access_token": access_token, "token_type": "bearer"}
+
+async def get_current_user():
+    return {"id": "default-user", "email": "user@example.com"}
+
+@app.post("/api/deploy", response_model=dict)
+async def deploy_app(
+    deployment: DeploymentRequest, 
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    app_id = str(uuid.uuid4())[:8]
+    port = deployment.port or (CONFIG["port_range_start"] + len(apps_db))
+    
+    if CONFIG["domain"] == "localhost":
+        url = f"http://localhost:{port}"
+        subdomain = f"localhost:{port}"
+    else:
+        subdomain = deployment.name.lower().replace(" ", "-")
+        url = f"https://{subdomain}.{CONFIG['domain']}"
+
+    db_app = App(
+        id=app_id,
+        name=deployment.name,
+        status="building",
+        url=url,
+        port=port,
+        git_url=deployment.git_url,
+        environment_variables=json.dumps(deployment.environment_variables),
+        user_id=current_user["id"]
+    )
+    db.add(db_app)
+    db.commit()
+
+    app_data = {
+        "id": app_id,
+        "name": deployment.name,
+        "status": "building",
+        "url": url,
+        "port": port,
+        "git_url": deployment.git_url,
+        "environment_variables": deployment.environment_variables,
+        "created_at": datetime.now().isoformat(),
+        "container_id": None,
+        "subdomain": subdomain,
+        "user_id": current_user["id"]
+    }
+    
+    apps_db[app_id] = app_data
+    background_tasks.add_task(deploy_app_background, app_id, deployment, subdomain, db)
+    
+    return {
+        "app_id": app_id, 
+        "status": "building", 
+        "url": url,
+        "message": "Deployment started"
+    }
+
+async def deploy_app_background(app_id: str, deployment: DeploymentRequest, subdomain: str, db: Session):
+    try:
+        app_data = apps_db[app_id]
+        print(f"🛠️ Building app: {app_data['name']} ({app_id})")
+        if deployment.git_url:
+            await build_from_git(app_id, deployment, subdomain, db)
+        else:
+            raise HTTPException(400, "Only Git deployment supported in this version")
+    except Exception as e:
+        apps_db[app_id]["status"] = "error"
+        apps_db[app_id]["error"] = str(e)
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db_app.status = "error"
+            db.commit()
+        
+        print(f"❌ Deployment failed for {app_id}: {e}")
+
+def create_app_container(app_id: str, image_tag: str, environment_vars: dict, port: int, subdomain: str):
+    labels = {
+        "traefik.enable": "true",
+        f"traefik.http.routers.app-{app_id}.rule": f"Host(`{subdomain}.{CONFIG['domain']}`)",
+        f"traefik.http.routers.app-{app_id}.entrypoints": "websecure",
+        f"traefik.http.routers.app-{app_id}.tls.certresolver": "myresolver",
+        f"traefik.http.services.app-{app_id}.loadbalancer.server.port": str(port)
+    }
+    
+    resource_limits = {
+        "memory": "512M",
+        "memory_reservation": "256M",
+        "nano_cpus": 500000000,
+        "cpu_period": 100000,
+        "cpu_quota": 50000,
+    }
+
+    security_opt = ["no-new-privileges:true"]
+
+    container = docker_client.containers.run(
+        image_tag,
+        detach=True,
+        name=f"app-{app_id}",
+        network=CONFIG["docker_network"],
+        environment=environment_vars,
+        labels=labels,
+        ports={f"{port}/tcp": port} if CONFIG["domain"] == "localhost" else {},
+        mem_limit=resource_limits["memory"],
+        mem_reservation=resource_limits["memory_reservation"],
+        cpu_period=resource_limits["cpu_period"],
+        cpu_quota=resource_limits["cpu_quota"],
+        security_opt=security_opt,
+        restart_policy={"Name": "on-failure", "MaximumRetryCount": 3},
+    )
+    return container
+
+async def build_from_git(app_id: str, deployment: DeploymentRequest, subdomain: str, db: Session):
+    app_data = apps_db[app_id]
+    try:
+        build_path = f"/tmp/builds/{app_id}"
+        os.makedirs(build_path, exist_ok=True)
+        
+        print(f"📥 Cloning {deployment.git_url}...")
+        result = subprocess.run(
+            ["git", "clone", deployment.git_url, build_path],
+            capture_output=True, text=True, timeout=300
+        )
+        
+        if result.returncode != 0:
+            raise Exception(f"Git clone failed: {result.stderr}")
+        
+        dockerfile_path = os.path.join(build_path, "Dockerfile")
+        if not os.path.exists(dockerfile_path):
+            await generate_dockerfile(build_path)
+        
+        image_tag = f"mini-cloud-app-{app_id}:latest"
+        print(f"🐳 Building Docker image: {image_tag}")
+        image, logs = docker_client.images.build(path=build_path, tag=image_tag, rm=True)
+        
+        environment_vars = {**app_data["environment_variables"], "PORT": str(app_data["port"])}
+        container = create_app_container(app_id, image_tag, environment_vars, app_data["port"], subdomain)
+        
+        apps_db[app_id]["status"] = "running"
+        apps_db[app_id]["container_id"] = container.id
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db_app.status = "running"
+            db_app.container_id = container.id
+            db.commit()
+        
+        print(f"✅ Successfully deployed {app_data['name']} at {app_data['url']}")
+    except Exception as e:
+        apps_db[app_id]["status"] = "error"
+        apps_db[app_id]["error"] = str(e)
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db_app.status = "error"
+            db.commit()
+            
+        raise
+
+async def generate_dockerfile(build_path: str):
+    if os.path.exists(os.path.join(build_path, "package.json")):
+        dockerfile_content = """
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]
+"""
+    elif os.path.exists(os.path.join(build_path, "requirements.txt")):
+        dockerfile_content = """
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["python", "app.py"]
+"""
+    else:
+        dockerfile_content = """
+FROM nginx:alpine
+COPY . /usr/share/nginx/html
+EXPOSE 80
+"""
+    with open(os.path.join(build_path, "Dockerfile"), "w") as f:
+        f.write(dockerfile_content)
+
+@app.get("/api/apps", response_model=List[AppStatus])
+async def list_apps(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    apps = db.query(App).filter(App.user_id == current_user["id"]).all()
+    return [AppStatus(
+        id=app.id,
+        name=app.name,
+        status=app.status,
+        url=app.url,
+        port=app.port,
+        git_url=app.git_url,
+        container_id=app.container_id,
+        created_at=app.created_at.isoformat()
+    ) for app in apps]
+
+@app.get("/api/apps/{app_id}", response_model=AppStatus)
+async def get_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    app = db.query(App).filter(App.id == app_id, App.user_id == current_user["id"]).first()
+    if not app:
+        raise HTTPException(404, "App not found")
+    return AppStatus(
+        id=app.id,
+        name=app.name,
+        status=app.status,
+        url=app.url,
+        port=app.port,
+        git_url=app.git_url,
+        container_id=app.container_id,
+        created_at=app.created_at.isoformat()
+    )
+
+@app.post("/api/apps/{app_id}/start")
+async def start_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    app_data = apps_db[app_id]
+    if not app_data["container_id"]:
+        raise HTTPException(400, "App not deployed properly")
+    try:
+        container = docker_client.containers.get(app_data["container_id"])
+        container.start()
+        apps_db[app_id]["status"] = "running"
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db_app.status = "running"
+            db.commit()
+            
+        return {"status": "success", "message": "App started"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to start app: {str(e)}")
+
+@app.post("/api/apps/{app_id}/stop")
+async def stop_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    app_data = apps_db[app_id]
+    if not app_data["container_id"]:
+        raise HTTPException(400, "App not deployed properly")
+    try:
+        container = docker_client.containers.get(app_data["container_id"])
+        container.stop()
+        apps_db[app_id]["status"] = "stopped"
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db_app.status = "stopped"
+            db.commit()
+            
+        return {"status": "success", "message": "App stopped"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to stop app: {str(e)}")
+
+@app.post("/api/apps/{app_id}/restart")
+async def restart_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    app_data = apps_db[app_id]
+    if not app_data["container_id"]:
+        raise HTTPException(400, "App not deployed properly")
+    try:
+        container = docker_client.containers.get(app_data["container_id"])
+        container.restart()
+        apps_db[app_id]["status"] = "running"
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db_app.status = "running"
+            db.commit()
+            
+        return {"status": "success", "message": "App restarted"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to restart app: {str(e)}")
+
+@app.delete("/api/apps/{app_id}")
+async def delete_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    app_data = apps_db[app_id]
+    try:
+        if app_data["container_id"]:
+            container = docker_client.containers.get(app_data["container_id"])
+            container.stop()
+            container.remove()
+        image_tag = f"mini-cloud-app-{app_id}:latest"
+        try:
+            docker_client.images.remove(image_tag)
+        except:
+            pass
+        
+        db_app = db.query(App).filter(App.id == app_id).first()
+        if db_app:
+            db.delete(db_app)
+            db.commit()
+            
+        del apps_db[app_id]
+        
+        return {"status": "success", "message": "App deleted"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete app: {str(e)}")
+
+@app.get("/api/apps/{app_id}/logs")
+async def get_app_logs(app_id: str, lines: int = 100, current_user: dict = Depends(get_current_user)):
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    app_data = apps_db[app_id]
+    if not app_data["container_id"]:
+        raise HTTPException(400, "App not deployed properly")
+    try:
+        container = docker_client.containers.get(app_data["container_id"])
+        logs = container.logs(tail=lines).decode('utf-8')
+        return {"logs": logs}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get logs: {str(e)}")
+
+@app.get("/api/stats")
+async def get_platform_stats(db: Session = Depends(get_db)):
+    total_apps = db.query(App).count()
+    running_apps = db.query(App).filter(App.status == "running").count()
+    return {
+        "total_apps": total_apps,
+        "running_apps": running_apps,
+        "stopped_apps": total_apps - running_apps,
+        "domain": CONFIG["domain"],
+        "uptime": "0"
+    }
+
+app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="dashboard")
+
+@app.get("/dashboard")
+async def serve_dashboard():
+    return FileResponse('dashboard/index.html')
+
+@app.get("/api/apps/{app_id}/stats")
+async def get_app_stats(app_id: str, current_user: dict = Depends(get_current_user)):
+    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
+        raise HTTPException(404, "App not found")
+    try:
+        container = docker_client.containers.get(apps_db[app_id]["container_id"])
+        stats = container.stats(stream=False)
+        cpu_stats = stats["cpu_stats"]
+        memory_stats = stats["memory_stats"]
+        return {
+            "cpu_usage": calculate_cpu_percent(cpu_stats),
+            "memory_usage": memory_stats.get("usage", 0),
+            "memory_limit": memory_stats.get("limit", 0),
+            "network_io": stats["networks"],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get stats: {str(e)}")
+
+def calculate_cpu_percent(cpu_stats):
+    cpu_delta = cpu_stats["cpu_usage"]["total_usage"] - cpu_stats["precpu_usage"]["total_usage"]
+    system_delta = cpu_stats["system_cpu_usage"] - cpu_stats["precpu_usage"]["system_cpu_usage"]
+    if system_delta > 0 and cpu_delta > 0:
+        return (cpu_delta / system_delta) * 100.0
+    return 0.0
+
+@app.post("/api/admin/backup")
+async def trigger_backup(
+    background_tasks: BackgroundTasks
+):
+    background_tasks.add_task(perform_full_backup)
+    return {"status": "success", "message": "Backup started"}
+
+@app.get("/api/admin/backups")
+async def list_backups():
+    backup_files = []
+    backup_dir = "/app/backups"
+    
+    if os.path.exists(backup_dir):
+        for filename in os.listdir(backup_dir):
+            filepath = os.path.join(backup_dir, filename)
+            if os.path.isfile(filepath):
+                backup_files.append({
+                    "name": filename,
+                    "size": os.path.getsize(filepath),
+                    "created": datetime.fromtimestamp(os.path.getctime(filepath)).isoformat()
+                })
+    
+    return {"backups": backup_files}
+
+def perform_full_backup():
+    os.makedirs("/app/backups", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = f"/app/backups/backup_{timestamp}.tar.gz"
+    
+    try:
+        subprocess.run(
+            ["tar", "-czf", backup_path, "/app/data", "/tmp/builds"],
+            check=True
+        )
+        print(f"✅ Backup created: {backup_path}")
+    except Exception as e:
+        print(f"❌ Backup failed: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
