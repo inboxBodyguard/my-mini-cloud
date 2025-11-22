@@ -55,7 +55,7 @@ Mini Cloud Platform transforms any VPS into a Heroku-like deployment system. Pus
 1. **Clone the repository:**
 
 ```bash
-git clone https://github.com/yourusername/mini-cloud-platform.git
+git clone https://github.com/inboxBodyguard/mini-cloud-platform.git
 cd mini-cloud-platform
 ```
 
