@@ -15,11 +15,8 @@ import docker
 from docker.models.containers import Container
 from flask import jsonify, request
 import psutil
-import docker
 import asyncio
 from datetime import datetime
-
-
 # Database imports
 from sqlalchemy.orm import Session
 from database import get_db, User, App, APIKey
