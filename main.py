@@ -87,6 +87,21 @@ async def startup():
         )
         print(f"✅ Created Docker network: {CONFIG['docker_network']}")
 
+@app.get("/api/apps/{app_id}/health")
+async def check_app_health(app_id: str):
+    if app_id not in apps_db:
+        return {"status": "unknown"}
+    
+    try:
+        container = docker_client.containers.get(apps_db[app_id]["container_id"])
+        # Basic TCP check on app port
+        import socket
+        sock = socket.create_connection(("localhost", apps_db[app_id]["port"]), timeout=2)
+        sock.close()
+        return {"status": "healthy"}
+    except:
+        return {"status": "unhealthy"}
+
 @app.get("/")
 async def root():
     return {"message": "Mini Cloud Platform API", "version": "1.0.0"}
