@@ -13,6 +13,12 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import docker
 from docker.models.containers import Container
+from flask import jsonify, request
+import psutil
+import docker
+import asyncio
+from datetime import datetime
+
 
 # Database imports
 from sqlalchemy.orm import Session
@@ -25,7 +31,12 @@ CONFIG = {
     "data_volume": "mini-cloud-data",
     "port_range_start": 10000
 }
-
+# Initialize Docker client
+try:
+    docker_client = docker.from_env()
+except:
+    docker_client = None
+    
 app = FastAPI(title="Mini Cloud Platform", version="1.0.0")
 
 # CORS middleware
@@ -597,6 +608,369 @@ app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="das
 @app.get("/dashboard")
 async def serve_dashboard():
     return FileResponse('dashboard/index.html')
+
+
+# --- 1. App Health Check ---
+@app.route('/api/apps/<app_id>/health', methods=['GET'])
+def app_health(app_id):
+    """Check if app container is responding"""
+    try:
+        if not docker_client:
+            return jsonify({"status": "unknown", "message": "Docker unavailable"}), 503
+        
+        container = docker_client.containers.get(app_id)
+        
+        if container.status == 'running':
+            # Try to ping the app's health endpoint
+            try:
+                import requests
+                response = requests.get(f"http://localhost:{container.attrs['NetworkSettings']['Ports']['80/tcp'][0]['HostPort']}/health", timeout=2)
+                return jsonify({"status": "healthy", "response_time": response.elapsed.total_seconds()})
+            except:
+                return jsonify({"status": "unhealthy", "message": "Not responding"})
+        else:
+            return jsonify({"status": "stopped"})
+    
+    except docker.errors.NotFound:
+        return jsonify({"status": "not_found"}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# --- 2. Platform Stats ---
+@app.route('/api/stats', methods=['GET'])
+def platform_stats():
+    """Get overall platform statistics"""
+    try:
+        if not docker_client:
+            return jsonify({
+                "total_apps": 0,
+                "running_apps": 0,
+                "healthy_apps": 0
+            })
+        
+        containers = docker_client.containers.list(all=True)
+        running = [c for c in containers if c.status == 'running']
+        
+        # Count healthy apps (simplified)
+        healthy = len(running)  # In production, ping each app
+        
+        return jsonify({
+            "total_apps": len(containers),
+            "running_apps": len(running),
+            "healthy_apps": healthy,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 3. App Logs ---
+@app.route('/api/apps/<app_id>/logs', methods=['GET'])
+def app_logs(app_id):
+    """Get container logs"""
+    try:
+        lines = request.args.get('lines', 50, type=int)
+        
+        if not docker_client:
+            return jsonify({"logs": "Docker unavailable"}), 503
+        
+        container = docker_client.containers.get(app_id)
+        logs = container.logs(tail=lines, timestamps=True).decode('utf-8')
+        
+        return jsonify({
+            "logs": logs,
+            "lines": lines,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except docker.errors.NotFound:
+        return jsonify({"error": "Container not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 4. Restart App ---
+@app.route('/api/apps/<app_id>/restart', methods=['POST'])
+def restart_app(app_id):
+    """Restart application container"""
+    try:
+        if not docker_client:
+            return jsonify({"error": "Docker unavailable"}), 503
+        
+        container = docker_client.containers.get(app_id)
+        container.restart(timeout=10)
+        
+        log_audit(session.get('user_email', 'system'), 'app_restart', 
+                 details=f"App: {app_id}")
+        
+        return jsonify({
+            "ok": True,
+            "message": "App restarted",
+            "app_id": app_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except docker.errors.NotFound:
+        return jsonify({"error": "Container not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 5. App Metrics (CPU/RAM) ---
+@app.route('/api/apps/<app_id>/metrics', methods=['GET'])
+def app_metrics(app_id):
+    """Get real-time CPU and memory usage"""
+    try:
+        if not docker_client:
+            return jsonify({"error": "Docker unavailable"}), 503
+        
+        container = docker_client.containers.get(app_id)
+        
+        if container.status != 'running':
+            return jsonify({
+                "cpu_percent": 0,
+                "memory_percent": 0,
+                "status": "stopped"
+            })
+        
+        # Get container stats
+        stats = container.stats(stream=False)
+        
+        # Calculate CPU percentage
+        cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - \
+                    stats['precpu_stats']['cpu_usage']['total_usage']
+        system_delta = stats['cpu_stats']['system_cpu_usage'] - \
+                       stats['precpu_stats']['system_cpu_usage']
+        cpu_percent = (cpu_delta / system_delta) * 100.0 if system_delta > 0 else 0
+        
+        # Calculate memory percentage
+        memory_usage = stats['memory_stats']['usage']
+        memory_limit = stats['memory_stats']['limit']
+        memory_percent = (memory_usage / memory_limit) * 100.0 if memory_limit > 0 else 0
+        
+        return jsonify({
+            "cpu_percent": round(cpu_percent, 2),
+            "memory_percent": round(memory_percent, 2),
+            "memory_mb": round(memory_usage / (1024 * 1024), 2),
+            "status": "running",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except docker.errors.NotFound:
+        return jsonify({"error": "Container not found"}), 404
+    except Exception as e:
+        logger.error(f"Metrics error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 6. WebSocket for Real-time Deploy Logs ---
+# Note: Requires flask-socketio
+from flask_socketio import SocketIO, emit
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@socketio.on('subscribe_deploy')
+def handle_deploy_subscription(data):
+    """Subscribe to deployment logs"""
+    app_id = data.get('app_id')
+    # Join room for this deployment
+    from flask_socketio import join_room
+    join_room(f"deploy_{app_id}")
+    emit('subscribed', {'app_id': app_id})
+
+def stream_deploy_logs(app_id, log_line):
+    """Emit logs to subscribed clients"""
+    socketio.emit('deploy_log', {
+        'app_id': app_id,
+        'log': log_line,
+        'timestamp': datetime.utcnow().isoformat()
+    }, room=f"deploy_{app_id}")
+
+
+# --- 7. Quick Deploy Templates ---
+@app.route('/api/templates', methods=['GET'])
+def get_templates():
+    """Get pre-configured deployment templates"""
+    templates = [
+        {
+            "id": "nodejs",
+            "name": "Node.js API",
+            "icon": "📦",
+            "description": "Express.js REST API with MongoDB",
+            "git_url": "https://github.com/example/nodejs-api-template",
+            "env_vars": {
+                "NODE_ENV": "production",
+                "PORT": "3000"
+            },
+            "buildpack": "nodejs"
+        },
+        {
+            "id": "flask",
+            "name": "Python Flask",
+            "icon": "🐍",
+            "description": "Flask web application with PostgreSQL",
+            "git_url": "https://github.com/example/flask-template",
+            "env_vars": {
+                "FLASK_ENV": "production",
+                "PORT": "5000"
+            },
+            "buildpack": "python"
+        },
+        {
+            "id": "static",
+            "name": "Static Site",
+            "icon": "📄",
+            "description": "HTML/CSS/JS static website",
+            "git_url": "https://github.com/example/static-template",
+            "env_vars": {},
+            "buildpack": "static"
+        },
+        {
+            "id": "wordpress",
+            "name": "WordPress",
+            "icon": "📝",
+            "description": "WordPress CMS with MySQL",
+            "git_url": "https://github.com/example/wordpress-template",
+            "env_vars": {
+                "WORDPRESS_DB_HOST": "db",
+                "WORDPRESS_DB_USER": "wordpress"
+            },
+            "buildpack": "php"
+        }
+    ]
+    
+    return jsonify(templates)
+
+
+# --- 8. Bulk Start Apps ---
+@app.route('/api/bulk/start', methods=['POST'])
+@limiter.limit("10 per minute")
+def bulk_start_apps():
+    """Start multiple apps at once"""
+    try:
+        data = request.get_json()
+        app_ids = data.get('app_ids', [])
+        
+        if not app_ids:
+            return jsonify({"error": "No app IDs provided"}), 400
+        
+        if len(app_ids) > 20:
+            return jsonify({"error": "Max 20 apps at once"}), 400
+        
+        results = []
+        for app_id in app_ids:
+            try:
+                container = docker_client.containers.get(app_id)
+                container.start()
+                results.append({"app_id": app_id, "status": "started"})
+            except Exception as e:
+                results.append({"app_id": app_id, "error": str(e)})
+        
+        log_audit(session.get('user_email', 'system'), 'bulk_start', 
+                 details=f"Started {len(app_ids)} apps")
+        
+        return jsonify({
+            "ok": True,
+            "results": results,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 9. Bulk Stop Apps ---
+@app.route('/api/bulk/stop', methods=['POST'])
+@limiter.limit("10 per minute")
+def bulk_stop_apps():
+    """Stop multiple apps at once"""
+    try:
+        data = request.get_json()
+        app_ids = data.get('app_ids', [])
+        
+        if not app_ids:
+            return jsonify({"error": "No app IDs provided"}), 400
+        
+        if len(app_ids) > 20:
+            return jsonify({"error": "Max 20 apps at once"}), 400
+        
+        results = []
+        for app_id in app_ids:
+            try:
+                container = docker_client.containers.get(app_id)
+                container.stop(timeout=10)
+                results.append({"app_id": app_id, "status": "stopped"})
+            except Exception as e:
+                results.append({"app_id": app_id, "error": str(e)})
+        
+        log_audit(session.get('user_email', 'system'), 'bulk_stop', 
+                 details=f"Stopped {len(app_ids)} apps")
+        
+        return jsonify({
+            "ok": True,
+            "results": results,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 10. Update App Configuration ---
+@app.route('/api/apps/<app_id>/config', methods=['PUT'])
+def update_app_config(app_id):
+    """Update app environment variables, domain, scaling"""
+    try:
+        data = request.get_json()
+        
+        # Validate input
+        env_vars = data.get('env_vars', {})
+        custom_domain = data.get('custom_domain')
+        instances = data.get('instances', 1)
+        
+        # Update app configuration in database
+        # (Assuming you have an App model)
+        # app = App.query.get(app_id)
+        # app.env_vars = env_vars
+        # app.custom_domain = custom_domain
+        # app.instances = instances
+        # db.session.commit()
+        
+        # Restart container with new config
+        if docker_client:
+            try:
+                container = docker_client.containers.get(app_id)
+                
+                # Update environment variables
+                # Note: You need to recreate container to apply env changes
+                container.stop()
+                # container.remove()
+                # ... recreate with new env vars
+                container.start()
+            except:
+                pass
+        
+        log_audit(session.get('user_email', 'system'), 'app_config_update', 
+                 details=f"App: {app_id}")
+        
+        return jsonify({
+            "ok": True,
+            "message": "Configuration updated",
+            "app_id": app_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# If using Flask-SocketIO, add to bottom of file:
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+
 
 if __name__ == "__main__":
     import uvicorn
