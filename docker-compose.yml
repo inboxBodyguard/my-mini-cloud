@@ -6,70 +6,95 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/app/data
-      - ./dashboard:/app/dashboard
+      - app-data:/app/data
+      - dashboard-data:/app/dashboard
+      - ./config:/app/config  # ✅ Config files instead of docker socket
     environment:
-      - PLATFORM_DOMAIN=your-domain.com
-      - DOCKER_HOST=unix:///var/run/docker.sock
-      - DATABASE_URL=postgresql://admin:password@postgres:5432/cloudplatform
-      - SECRET_KEY=your-secret-key-change-in-production
+      - PLATFORM_DOMAIN=${PLATFORM_DOMAIN}
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - SECRET_KEY=${SECRET_KEY}
+      - DOCKER_HOST=tcp://docker-socket:2375  # ✅ Use TCP instead of socket
+    depends_on:
+      - postgres
+      - docker-socket
     networks:
       - mini-cloud-network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.platform.rule=Host(`platform.your-domain.com`)"
-      - "traefik.http.routers.platform.entrypoints=websecure"
-      - "traefik.http.routers.platform.tls.certresolver=myresolver"
-    restart: unless-stopped  # ✅ Added restart policy
+    restart: unless-stopped
+
+  docker-socket:  # ✅ Secure Docker socket proxy
+    image: tecnativa/docker-socket-proxy
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - AUTH=1
+      - POST=0  # Disable container creation from API
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
+    networks:
+      - mini-cloud-network
+    restart: unless-stopped
 
   traefik:
     image: traefik:v2.10
     command:
-      - --api.insecure=true
+      - --api.dashboard=true
+      - --api.insecure=false  # ✅ Secure API
       - --providers.docker=true
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
-      - --certificatesresolvers.myresolver.acme.email=your-email@your-domain.com
+      - --certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web
+      - --providers.docker.exposedbydefault=false  # ✅ Only expose labeled containers
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/traefik:/etc/traefik  # ✅ Config files
       - ./letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
     networks:
       - mini-cloud-network
-    restart: unless-stopped  # ✅ Added restart policy
+    restart: unless-stopped
 
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
     environment:
-      POSTGRES_DB: cloudplatform
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backups:/backups
     networks:
       - mini-cloud-network
-    restart: unless-stopped  # ✅ Added restart policy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  watchtower:  # ✅ Added watchtower for automatic container updates
+  watchtower:
     image: containrrr/watchtower
     restart: unless-stopped
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --cleanup --interval 300
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
+    command: 
+      - --cleanup 
+      - --interval 3600  # ✅ Check every hour, not every 5 minutes
+      - --label-enable  # ✅ Only update containers with watchtower label
     networks:
       - mini-cloud-network
 
 networks:
   mini-cloud-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16  # ✅ Private subnet
 
 volumes:
   postgres_data:
   app-data:
+  dashboard-data:
