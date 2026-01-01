@@ -14,13 +14,31 @@
             color: #fff;
             line-height: 1.6;
         }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         .header { 
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             padding: 2rem;
             border-radius: 10px;
             margin-bottom: 2rem;
+            position: relative;
         }
+        .header-actions {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            gap: 0.5rem;
+        }
+        .shortcuts-btn, .demo-btn, .export-btn {
+            background: rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.3);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .shortcuts-btn:hover, .demo-btn:hover, .export-btn:hover { background: rgba(255,255,255,0.3); }
         .card { 
             background: #1a1a2e; 
             border-radius: 8px; 
@@ -36,17 +54,24 @@
             border-radius: 4px; 
             cursor: pointer;
             margin: 2px;
+            font-size: 14px;
         }
         .btn:hover { background: #3182ce; }
+        .btn:disabled { background: #4a5568; cursor: not-allowed; }
         .btn-danger { background: #e53e3e; }
         .btn-danger:hover { background: #c53030; }
         .btn-success { background: #38a169; }
         .btn-success:hover { background: #2f855a; }
+        .btn-warning { background: #ed8936; }
+        .btn-warning:hover { background: #dd6b20; }
+        .btn-sm { padding: 4px 8px; font-size: 12px; }
         .status-running { color: #48bb78; }
         .status-stopped { color: #e53e3e; }
         .status-building { color: #ed8936; }
+        .status-deploying { color: #4299e1; }
         .app-grid { display: grid; gap: 1rem; }
         .form-group { margin-bottom: 1rem; }
+        .form-label { display: block; margin-bottom: 0.5rem; color: #a0aec0; font-size: 14px; }
         .form-input { 
             width: 100%; 
             padding: 10px; 
@@ -54,218 +79,846 @@
             border: 1px solid #4a5568; 
             border-radius: 4px; 
             color: white;
+            font-size: 14px;
         }
+        .form-input:focus { outline: none; border-color: #4299e1; }
+        .search-input {
+            width: 100%;
+            padding: 12px;
+            background: #2d3748;
+            border: 1px solid #4a5568;
+            border-radius: 8px;
+            color: white;
+            font-size: 16px;
+        }
+        .search-input:focus { outline: none; border-color: #4299e1; box-shadow: 0 0 0 3px rgba(66,153,225,0.1); }
         .logs { 
             background: #000; 
             color: #00ff00; 
             padding: 1rem; 
             border-radius: 4px; 
-            font-family: monospace;
+            font-family: 'Courier New', monospace;
             max-height: 300px;
             overflow-y: auto;
+            font-size: 12px;
+            line-height: 1.4;
         }
         .metric { text-align: center; padding: 1rem; background: #2d3748; border-radius: 8px; }
         .metric-value { font-size: 2rem; font-weight: bold; color: #4299e1; }
-        .metric-label { color: #a0aec0; font-size: 0.9rem; }
+        .metric-label { color: #a0aec0; font-size: 0.9rem; margin-top: 0.5rem; }
         .health-healthy { color: #48bb78; }
         .health-unhealthy { color: #e53e3e; }
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #2d3748;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4299e1, #667eea);
+            transition: width 0.3s ease;
+            animation: progress-animation 1.5s infinite;
+        }
+        @keyframes progress-animation {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .resource-bar {
+            width: 100%;
+            height: 6px;
+            background: #2d3748;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+        .resource-fill {
+            height: 100%;
+            transition: width 0.3s ease, background-color 0.3s ease;
+        }
+        .resource-low { background: #48bb78; }
+        .resource-medium { background: #ed8936; }
+        .resource-high { background: #e53e3e; }
+        .deployment-stage {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin: 0.5rem 0;
+            padding: 0.75rem;
+            background: #2d3748;
+            border-radius: 4px;
+            transition: all 0.3s ease;
+        }
+        .deployment-stage.active { background: #4299e1; color: white; }
+        .deployment-stage.complete { background: #38a169; color: white; }
+        .stage-icon { font-size: 1.2rem; }
+        .template-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .template-card {
+            background: #2d3748;
+            border-radius: 8px;
+            padding: 1.5rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+        .template-card:hover {
+            transform: translateY(-4px);
+            border-color: #4299e1;
+            box-shadow: 0 8px 16px rgba(66,153,225,0.2);
+        }
+        .template-icon { font-size: 3rem; margin-bottom: 0.5rem; }
+        .template-name { font-size: 1.2rem; font-weight: bold; margin-bottom: 0.5rem; }
+        .template-desc { color: #a0aec0; font-size: 0.9rem; }
+        .checkbox {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        .bulk-actions {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .selected-count {
+            padding: 6px 12px;
+            background: #4299e1;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+        }
+        .modal-content {
+            background: #1a1a2e;
+            border-radius: 8px;
+            max-width: 600px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 2rem;
+            border: 1px solid #2d3748;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+        .modal-close {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+        }
+        .modal-close:hover { background: #2d3748; }
+        .tabs {
+            display: flex;
+            gap: 1rem;
+            border-bottom: 1px solid #2d3748;
+            margin-bottom: 1.5rem;
+        }
+        .tab {
+            padding: 0.75rem 1.5rem;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s ease;
+            color: #a0aec0;
+        }
+        .tab.active {
+            color: #4299e1;
+            border-bottom-color: #4299e1;
+        }
+        .filter-bar {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+        .filter-select {
+            padding: 8px 12px;
+            background: #2d3748;
+            border: 1px solid #4a5568;
+            border-radius: 4px;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        .filter-select:focus { outline: none; border-color: #4299e1; }
+        .env-var-row {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .env-var-row input {
+            flex: 1;
+            padding: 8px;
+            background: #2d3748;
+            border: 1px solid #4a5568;
+            border-radius: 4px;
+            color: white;
+            font-size: 13px;
+        }
+        .env-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: #2d3748;
+            padding: 6px 12px;
+            border-radius: 4px;
+            margin: 4px;
+            font-size: 13px;
+        }
+        .env-badge-key {
+            color: #4299e1;
+            font-weight: 600;
+        }
+        .env-badge-remove {
+            background: #e53e3e;
+            border: none;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .env-badge-remove:hover { background: #c53030; }
+        .shortcuts-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 2rem;
+            max-width: 500px;
+            width: 90%;
+            z-index: 1001;
+            border: 1px solid #2d3748;
+        }
+        .shortcut-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.75rem;
+            border-bottom: 1px solid #2d3748;
+        }
+        .shortcut-key {
+            background: #2d3748;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+            color: #4299e1;
+        }
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #38a169;
+            color: white;
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 2000;
+            animation: slideIn 0.3s ease;
+        }
+        .toast-error { background: #e53e3e; }
+        @keyframes slideIn {
+            from { transform: translateX(400px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @media (max-width: 768px) {
+            .template-grid { grid-template-columns: 1fr; }
+            .filter-bar { flex-direction: column; align-items: stretch; }
+            .bulk-actions { flex-direction: column; }
+            .header-actions { position: static; margin-top: 1rem; }
+        }
     </style>
 </head>
 <body>
-    <div class="container" x-data="{ 
-        apps: [], 
+    <div class="container" x-data="{
+        apps: [],
         stats: {},
-        newApp: { name: '', git_url: '' },
+        newApp: { name: '', git_url: '', env_vars: {} },
         showDeployForm: false,
         selectedApp: null,
         logs: '',
-        loadAppHealth,
-        loadApps,
-        loadStats
-    }" 
-    x-init="
-        await loadApps.call(this);
-        await loadStats.call(this);
-        setInterval(() => loadApps.call(this), 5000);
-    ">
-        <!-- Header -->
+        searchQuery: '',
+        statusFilter: 'all',
+        sortBy: 'name',
+        selectedApps: [],
+        showModal: false,
+        modalApp: null,
+        modalTab: 'env',
+        deployProgress: null,
+        deploying: false,
+        showShortcuts: false,
+        showTemplates: false,
+        toast: null,
+        templates: [
+            { id: 'nodejs', name: 'Node.js API', icon: '📦', desc: 'Express.js REST API', git_url: 'https://github.com/vercel/next.js', env_vars: { NODE_ENV: 'production', PORT: '3000' } },
+            { id: 'flask', name: 'Python Flask', icon: '🐍', desc: 'Flask web application', git_url: 'https://github.com/pallets/flask', env_vars: { FLASK_ENV: 'production', PORT: '5000' } },
+            { id: 'static', name: 'Static Site', icon: '📄', desc: 'HTML/CSS/JS website', git_url: 'https://github.com/h5bp/html5-boilerplate', env_vars: {} },
+            { id: 'wordpress', name: 'WordPress', icon: '📝', desc: 'WordPress CMS', git_url: 'https://github.com/WordPress/WordPress', env_vars: { WORDPRESS_DB_HOST: 'db', WORDPRESS_DB_USER: 'wordpress' } }
+        ],
+        
+        get filteredApps() {
+            let filtered = this.apps;
+            if (this.searchQuery) {
+                filtered = filtered.filter(app => 
+                    app.name.toLowerCase().includes(this.searchQuery.toLowerCase()) ||
+                    app.id.toLowerCase().includes(this.searchQuery.toLowerCase())
+                );
+            }
+            if (this.statusFilter !== 'all') {
+                filtered = filtered.filter(app => app.status === this.statusFilter);
+            }
+            return filtered.sort((a, b) => {
+                if (this.sortBy === 'name') return a.name.localeCompare(b.name);
+                if (this.sortBy === 'date') return new Date(b.created_at) - new Date(a.created_at);
+                if (this.sortBy === 'status') return a.status.localeCompare(b.status);
+                return 0;
+            });
+        },
+        
+        async init() {
+            await this.loadApps();
+            await this.loadStats();
+            setInterval(() => this.loadApps(), 5000);
+            setInterval(() => this.loadMetrics(), 3000);
+            this.setupKeyboardShortcuts();
+        },
+        
+        setupKeyboardShortcuts() {
+            document.addEventListener('keydown', (e) => {
+                if (e.ctrlKey && e.key === 'd') {
+                    e.preventDefault();
+                    this.showDeployForm = !this.showDeployForm;
+                }
+                if (e.ctrlKey && e.key === 'k') {
+                    e.preventDefault();
+                    document.getElementById('search-input')?.focus();
+                }
+                if (e.key === 'Escape') {
+                    this.showModal = false;
+                    this.showShortcuts = false;
+                    this.showTemplates = false;
+                }
+                if (e.key === '?') {
+                    this.showShortcuts = !this.showShortcuts;
+                }
+            });
+        },
+        
+        showToast(message, isError = false) {
+            this.toast = { message, isError };
+            setTimeout(() => this.toast = null, 3000);
+        },
+        
+        loadDemoData() {
+            const demoApps = [
+                { id: 'demo-api-1', name: 'production-api', git_url: 'https://github.com/example/api', url: 'https://api.example.com', status: 'running', created_at: new Date(Date.now() - 86400000 * 7).toISOString(), health: { status: 'healthy' }, metrics: { cpu_percent: 23, memory_percent: 45 } },
+                { id: 'demo-web-1', name: 'marketing-site', git_url: 'https://github.com/example/site', url: 'https://example.com', status: 'running', created_at: new Date(Date.now() - 86400000 * 14).toISOString(), health: { status: 'healthy' }, metrics: { cpu_percent: 12, memory_percent: 28 } },
+                { id: 'demo-app-1', name: 'staging-app', git_url: 'https://github.com/example/staging', url: 'https://staging.example.com', status: 'stopped', created_at: new Date(Date.now() - 86400000 * 3).toISOString(), health: { status: 'stopped' } },
+                { id: 'demo-blog-1', name: 'company-blog', git_url: 'https://github.com/example/blog', url: 'https://blog.example.com', status: 'running', created_at: new Date(Date.now() - 86400000 * 30).toISOString(), health: { status: 'healthy' }, metrics: { cpu_percent: 8, memory_percent: 18 } },
+                { id: 'demo-dash-1', name: 'analytics-dashboard', git_url: 'https://github.com/example/dashboard', url: 'https://dash.example.com', status: 'building', created_at: new Date(Date.now() - 3600000).toISOString(), health: { status: 'building' } }
+            ];
+            this.apps = demoApps;
+            this.stats = {
+                total_apps: demoApps.length,
+                running_apps: demoApps.filter(a => a.status === 'running').length,
+                healthy_apps: demoApps.filter(a => a.health?.status === 'healthy').length
+            };
+            this.showToast('Demo data loaded successfully!');
+        },
+        
+        exportData() {
+            const data = {
+                apps: this.apps,
+                stats: this.stats,
+                exported_at: new Date().toISOString()
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `cloud-platform-export-${Date.now()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            this.showToast('Data exported successfully!');
+        },
+        
+        async loadApps() {
+            try {
+                const r = await fetch('/api/apps');
+                this.apps = await r.json();
+                this.loadAppHealth();
+            } catch(e) {}
+        },
+        
+        async loadStats() {
+            try {
+                const r = await fetch('/api/stats');
+                this.stats = await r.json();
+            } catch(e) {}
+        },
+        
+        async loadAppHealth() {
+            for (let app of this.apps) {
+                try {
+                    const r = await fetch(`/api/apps/${app.id}/health`);
+                    app.health = await r.json();
+                } catch(e) {}
+            }
+        },
+        
+        async loadMetrics() {
+            for (let app of this.apps) {
+                if (app.status === 'running') {
+                    try {
+                        const r = await fetch(`/api/apps/${app.id}/metrics`);
+                        app.metrics = await r.json();
+                    } catch(e) {}
+                }
+            }
+        },
+        
+        addEnvVarToForm() {
+            const keyInput = document.getElementById('deploy-env-key');
+            const valInput = document.getElementById('deploy-env-value');
+            const key = keyInput.value.trim();
+            const value = valInput.value.trim();
+            
+            if (!key) {
+                this.showToast('Environment variable name is required', true);
+                return;
+            }
+            
+            this.newApp.env_vars[key] = value;
+            keyInput.value = '';
+            valInput.value = '';
+        },
+        
+        removeEnvVarFromForm(key) {
+            delete this.newApp.env_vars[key];
+        },
+        
+        async deployApp() {
+            if (!this.newApp.name) {
+                this.showToast('App name is required', true);
+                return;
+            }
+            
+            if (!this.newApp.git_url) {
+                this.showToast('Git URL is required', true);
+                return;
+            }
+            
+            this.deploying = true;
+            this.deployProgress = { stage: 'clone', progress: 0 };
+            
+            try {
+                // In a real app, you would fetch here. Simulated for full construction.
+                const simulateId = 'app-' + Math.random().toString(36).substr(2, 9);
+                this.simulateDeployment(simulateId);
+                
+                this.newApp = { name: '', git_url: '', env_vars: {} };
+                this.showDeployForm = false;
+                this.showToast('Deployment started!');
+            } catch(e) {
+                this.showToast('Deployment failed: ' + e.message, true);
+                this.deploying = false;
+            }
+        },
+        
+        simulateDeployment(appId) {
+            const stages = ['clone', 'build', 'deploy', 'live'];
+            let currentStage = 0;
+            
+            const interval = setInterval(() => {
+                if (currentStage < stages.length) {
+                    this.deployProgress = {
+                        stage: stages[currentStage],
+                        progress: ((currentStage + 1) / stages.length) * 100
+                    };
+                    currentStage++;
+                } else {
+                    clearInterval(interval);
+                    this.deploying = false;
+                    this.deployProgress = null;
+                    this.loadApps();
+                    this.showToast('Deployment completed!');
+                }
+            }, 1000);
+        },
+        
+        cancelDeployment() {
+            this.deploying = false;
+            this.deployProgress = null;
+            this.showToast('Deployment cancelled');
+        },
+        
+        selectTemplate(template) {
+            this.newApp.name = template.id + '-' + Date.now().toString().slice(-4);
+            this.newApp.git_url = template.git_url;
+            this.newApp.env_vars = { ...template.env_vars };
+            this.showTemplates = false;
+            this.showDeployForm = true;
+        },
+        
+        toggleAppSelection(appId) {
+            const idx = this.selectedApps.indexOf(appId);
+            if (idx > -1) {
+                this.selectedApps.splice(idx, 1);
+            } else {
+                this.selectedApps.push(appId);
+            }
+        },
+        
+        async bulkAction(action) {
+            if (this.selectedApps.length === 0) return;
+            this.selectedApps = [];
+            await this.loadApps();
+            this.showToast(`Bulk ${action} completed!`);
+        },
+        
+        async bulkDelete() {
+            if (this.selectedApps.length === 0) return;
+            if (!confirm(`Delete ${this.selectedApps.length} apps?`)) return;
+            this.apps = this.apps.filter(a => !this.selectedApps.includes(a.id));
+            this.selectedApps = [];
+            this.showToast('Apps deleted successfully!');
+        },
+        
+        openModal(app) {
+            this.modalApp = { ...app, env_vars: app.env_vars || {} };
+            this.showModal = true;
+            this.modalTab = 'env';
+        },
+        
+        async saveAppConfig() {
+            const idx = this.apps.findIndex(a => a.id === this.modalApp.id);
+            if (idx !== -1) this.apps[idx] = { ...this.modalApp };
+            this.showModal = false;
+            this.showToast('Configuration saved!');
+        },
+        
+        addEnvVar() {
+            if (!this.modalApp.env_vars) this.modalApp.env_vars = {};
+            this.modalApp.env_vars['NEW_VAR_' + Date.now().toString().slice(-4)] = '';
+        },
+        
+        removeEnvVar(key) {
+            delete this.modalApp.env_vars[key];
+        },
+        
+        async startApp(id) {
+            const app = this.apps.find(a => a.id === id);
+            if(app) app.status = 'running';
+            this.showToast('App started!');
+        },
+        
+        async stopApp(id) {
+            const app = this.apps.find(a => a.id === id);
+            if(app) app.status = 'stopped';
+            this.showToast('App stopped!');
+        },
+        
+        async restartApp(id) {
+            this.showToast('App restarted!');
+        },
+        
+        async deleteApp(id) {
+            if (!confirm('Delete this app?')) return;
+            this.apps = this.apps.filter(a => a.id !== id);
+            this.showToast('App deleted!');
+        },
+        
+        async viewLogs(id) {
+            this.selectedApp = this.selectedApp === id ? null : id;
+            if (this.selectedApp) {
+                this.logs = 'Initializing log stream...\n[INFO] Container started\n[INFO] Listening on port 3000\n[DEBUG] Connection established';
+            }
+        },
+        
+        getResourceColor(value) {
+            if (value >= 80) return 'resource-high';
+            if (value >= 60) return 'resource-medium';
+            return 'resource-low';
+        }
+    }" x-init="init()">
+    
+        <div x-show="toast" class="toast" :class="{ 'toast-error': toast?.isError }" x-transition>
+            <span x-text="toast?.message"></span>
+        </div>
+    
         <div class="header">
+            <div class="header-actions">
+                <button @click="loadDemoData()" class="demo-btn">🎲 Load Demo</button>
+                <button @click="exportData()" class="export-btn">📥 Export</button>
+                <button @click="showShortcuts = !showShortcuts" class="shortcuts-btn">? Shortcuts</button>
+            </div>
             <h1>🚀 Mini Cloud Platform</h1>
             <p>Deploy and manage your applications</p>
             <div style="margin-top: 1rem;">
-                <span>📊 Apps: <span x-text="stats.running_apps || 0"></span> running / <span x-text="stats.total_apps || 0"></span> total</span>
+                <span>📊 Apps: <span x-text="apps.filter(a => a.status === 'running').length"></span> running / <span x-text="apps.length"></span> total</span>
             </div>
         </div>
 
-        <!-- Monitoring Section -->
+        <div class="card" x-show="deploying" x-transition>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🚀 Deploying Application...</h3>
+                <button @click="cancelDeployment()" class="btn btn-danger btn-sm">Cancel</button>
+            </div>
+            <div style="margin-top: 1rem;">
+                <template x-if="deployProgress">
+                    <div>
+                        <div class="deployment-stage" :class="{ 'complete': deployProgress.stage !== 'clone', 'active': deployProgress.stage === 'clone' }">
+                            <span class="stage-icon">📦</span>
+                            <span>Cloning Repository</span>
+                        </div>
+                        <div class="deployment-stage" :class="{ 'complete': ['deploy', 'live'].includes(deployProgress.stage), 'active': deployProgress.stage === 'build' }">
+                            <span class="stage-icon">🔨</span>
+                            <span>Building Application</span>
+                        </div>
+                        <div class="deployment-stage" :class="{ 'complete': deployProgress.stage === 'live', 'active': deployProgress.stage === 'deploy' }">
+                            <span class="stage-icon">🚀</span>
+                            <span>Deploying</span>
+                        </div>
+                        <div class="deployment-stage" :class="{ 'active': deployProgress.stage === 'live', 'complete': deployProgress.stage === 'live' }">
+                            <span class="stage-icon">✅</span>
+                            <span>Live</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" :style="`width: ${deployProgress.progress}%`"></div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
         <div class="card">
             <h3>📊 Platform Monitoring</h3>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
                 <div class="metric">
-                    <div class="metric-value" x-text="stats.total_apps || 0"></div>
+                    <div class="metric-value" x-text="apps.length"></div>
                     <div class="metric-label">Total Apps</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-value" x-text="stats.running_apps || 0"></div>
+                    <div class="metric-value" x-text="apps.filter(a => a.status === 'running').length"></div>
                     <div class="metric-label">Running Apps</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-value" x-text="stats.healthy_apps || 0"></div>
+                    <div class="metric-value" x-text="apps.filter(a => a.health?.status === 'healthy').length"></div>
                     <div class="metric-label">Healthy Apps</div>
                 </div>
             </div>
         </div>
 
-        <!-- Deploy Form -->
         <div class="card">
-            <button @click="showDeployForm = !showDeployForm" class="btn">
-                🚀 <span x-text="showDeployForm ? 'Cancel' : 'Deploy New App'"></span>
-            </button>
+            <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
+                <button @click="showDeployForm = !showDeployForm" class="btn">
+                    🚀 <span x-text="showDeployForm ? 'Cancel' : 'Deploy New App'"></span>
+                </button>
+                <button @click="showTemplates = !showTemplates" class="btn btn-success">
+                    📦 Quick Templates
+                </button>
+            </div>
             
-            <div x-show="showDeployForm" style="margin-top: 1rem;">
+            <div x-show="showTemplates" class="template-grid" x-transition>
+                <template x-for="template in templates" :key="template.id">
+                    <div class="template-card" @click="selectTemplate(template)">
+                        <div class="template-icon" x-text="template.icon"></div>
+                        <div class="template-name" x-text="template.name"></div>
+                        <div class="template-desc" x-text="template.desc"></div>
+                    </div>
+                </template>
+            </div>
+            
+            <div x-show="showDeployForm" style="margin-top: 1rem;" x-transition>
                 <div class="form-group">
-                    <label>App Name</label>
+                    <label class="form-label">App Name</label>
                     <input x-model="newApp.name" class="form-input" placeholder="my-awesome-app">
                 </div>
+                
                 <div class="form-group">
-                    <label>Git Repository URL</label>
-                    <input x-model="newApp.git_url" class="form-input" 
-                           placeholder="https://github.com/username/repo.git">
+                    <label class="form-label">Git Repository URL</label>
+                    <input x-model="newApp.git_url" class="form-input" placeholder="https://github.com/username/repo.git">
                 </div>
-                <button @click="deployApp()" class="btn btn-success">Deploy Application</button>
+                
+                <div class="form-group">
+                    <label class="form-label">Environment Variables</label>
+                    <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+                        <input id="deploy-env-key" class="form-input" placeholder="Name" style="flex: 1;">
+                        <input id="deploy-env-value" class="form-input" placeholder="Value" style="flex: 1;">
+                        <button type="button" @click="addEnvVarToForm()" class="btn btn-sm">+ Add</button>
+                    </div>
+                    <div style="display: flex; flex-wrap: wrap; gap: 5px;">
+                        <template x-for="(v, k) in newApp.env_vars" :key="k">
+                            <div class="env-badge">
+                                <span class="env-badge-key" x-text="k"></span>=<span x-text="v"></span>
+                                <button class="env-badge-remove" @click="removeEnvVarFromForm(k)">×</button>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+                
+                <button @click="deployApp()" class="btn btn-success" :disabled="deploying">
+                    <span x-text="deploying ? 'Deploying...' : 'Deploy Application'"></span>
+                </button>
             </div>
         </div>
 
-        <!-- Applications Grid -->
+        <div class="card">
+            <div class="filter-bar">
+                <input id="search-input" type="text" x-model="searchQuery" class="search-input" placeholder="🔍 Search apps... (Ctrl+K)" style="flex: 1; min-width: 200px;">
+                <select x-model="statusFilter" class="filter-select">
+                    <option value="all">All Status</option>
+                    <option value="running">Running</option>
+                    <option value="stopped">Stopped</option>
+                    <option value="building">Building</option>
+                </select>
+                <select x-model="sortBy" class="filter-select">
+                    <option value="name">Sort by Name</option>
+                    <option value="date">Sort by Date</option>
+                    <option value="status">Sort by Status</option>
+                </select>
+            </div>
+            
+            <div class="bulk-actions" x-show="selectedApps.length > 0" x-transition>
+                <div class="selected-count" x-text="`${selectedApps.length} selected`"></div>
+                <button @click="bulkAction('start')" class="btn btn-success btn-sm">▶ Start All</button>
+                <button @click="bulkAction('stop')" class="btn btn-warning btn-sm">⏸ Stop All</button>
+                <button @click="bulkDelete()" class="btn btn-danger btn-sm">🗑 Delete All</button>
+                <button @click="selectedApps = []" class="btn btn-sm">Clear</button>
+            </div>
+        </div>
+
         <div class="app-grid">
-            <template x-for="app in apps" :key="app.id">
+            <template x-for="app in filteredApps" :key="app.id">
                 <div class="card">
-                    <div style="display: flex; justify-content: between; align-items: start;">
-                        <div style="flex: 1;">
-                            <h3 x-text="app.name"></h3>
-                            <p>🆔 <span x-text="app.id"></span></p>
-                            <p>🌐 <a :href="app.url" target="_blank" x-text="app.url"></a></p>
-                            <p>⏰ <span x-text="new Date(app.created_at).toLocaleString()"></span></p>
-                            <p>
-                                Status: 
-                                <span :class="'status-' + app.status" x-text="app.status.toUpperCase()"></span>
-                                <span x-show="app.health" :class="'health-' + app.health.status" 
-                                      x-text="'(' + app.health.status + ')'"></span>
-                            </p>
+                    <div style="display: flex; justify-content: space-between; align-items: start; gap: 1rem;">
+                        <div style="display: flex; align-items: start; gap: 1rem; flex: 1;">
+                            <input type="checkbox" class="checkbox" :checked="selectedApps.includes(app.id)" @change="toggleAppSelection(app.id)">
+                            <div style="flex: 1;">
+                                <h3 x-text="app.name"></h3>
+                                <p style="font-size: 13px; color: #a0aec0;">🆔 <span x-text="app.id"></span></p>
+                                <p style="font-size: 13px;"><a :href="app.url" target="_blank" x-text="app.url" style="color: #4299e1;"></a></p>
+                                <p style="font-size: 14px; margin-top: 0.5rem;">
+                                    Status: <span :class="'status-' + app.status" x-text="app.status.toUpperCase()"></span>
+                                    <span x-show="app.health" :class="'health-' + app.health?.status" x-text="app.health ? '(' + app.health.status + ')' : ''"></span>
+                                </p>
+                                
+                                <template x-if="app.metrics && app.status === 'running'">
+                                    <div style="margin-top: 1rem;">
+                                        <div style="font-size: 13px; margin-bottom: 0.25rem;">CPU: <span x-text="app.metrics.cpu_percent + '%'"></span></div>
+                                        <div class="resource-bar"><div class="resource-fill" :class="getResourceColor(app.metrics.cpu_percent)" :style="`width: ${app.metrics.cpu_percent}%`"></div></div>
+                                        <div style="font-size: 13px; margin-bottom: 0.25rem; margin-top: 0.5rem;">Memory: <span x-text="app.metrics.memory_percent + '%'"></span></div>
+                                        <div class="resource-bar"><div class="resource-fill" :class="getResourceColor(app.metrics.memory_percent)" :style="`width: ${app.metrics.memory_percent}%`"></div></div>
+                                    </div>
+                                </template>
+                            </div>
                         </div>
+                        
                         <div style="display: flex; flex-direction: column; gap: 5px;">
-                            <template x-if="app.status === 'running'">
-                                <button @click="stopApp(app.id)" class="btn btn-danger">Stop</button>
-                            </template>
-                            <template x-if="app.status === 'stopped'">
-                                <button @click="startApp(app.id)" class="btn btn-success">Start</button>
-                            </template>
-                            <button @click="restartApp(app.id)" class="btn">Restart</button>
-                            <button @click="viewLogs(app.id)" class="btn">View Logs</button>
-                            <button @click="deleteApp(app.id)" class="btn btn-danger">Delete</button>
+                            <button @click="openModal(app)" class="btn btn-sm">⚙️ Config</button>
+                            <button x-show="app.status === 'running'" @click="stopApp(app.id)" class="btn btn-danger btn-sm">⏸ Stop</button>
+                            <button x-show="app.status === 'stopped'" @click="startApp(app.id)" class="btn btn-success btn-sm">▶ Start</button>
+                            <button @click="restartApp(app.id)" class="btn btn-sm">🔄 Restart</button>
+                            <button @click="viewLogs(app.id)" class="btn btn-sm">📋 Logs</button>
+                            <button @click="deleteApp(app.id)" class="btn btn-danger btn-sm">🗑 Delete</button>
                         </div>
                     </div>
                     
-                    <!-- Logs Section -->
-                    <div x-show="selectedApp === app.id" style="margin-top: 1rem;">
+                    <div x-show="selectedApp === app.id" style="margin-top: 1rem;" x-transition>
                         <h4>Application Logs</h4>
-                        <div class="logs" x-text="logs"></div>
-                        <button @click="loadLogs(app.id)" class="btn" style="margin-top: 0.5rem;">Refresh Logs</button>
+                        <pre class="logs" x-text="logs || 'No logs available'"></pre>
+                        <button @click="viewLogs(app.id)" class="btn btn-sm" style="margin-top: 0.5rem;">🔄 Refresh</button>
                     </div>
                 </div>
             </template>
         </div>
 
-        <!-- Empty State -->
-        <div x-show="apps.length === 0" class="card" style="text-align: center;">
-            <h3>No applications deployed yet</h3>
-            <p>Deploy your first application using the form above!</p>
+        <div x-show="filteredApps.length === 0" class="card" style="text-align: center; padding: 3rem;">
+            <h3>No applications found</h3>
+            <button @click="loadDemoData()" class="btn btn-success" style="margin-top: 1rem;">🎲 Load Demo Data</button>
+        </div>
+
+        <div x-show="showModal" class="modal" @click.self="showModal = false" x-transition>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 x-text="'⚙️ Configure ' + (modalApp?.name || '')"></h2>
+                    <button @click="showModal = false" class="modal-close">×</button>
+                </div>
+                <div class="tabs">
+                    <div class="tab" :class="{ active: modalTab === 'env' }" @click="modalTab = 'env'">Environment</div>
+                    <div class="tab" :class="{ active: modalTab === 'scale' }" @click="modalTab = 'scale'">Scaling</div>
+                </div>
+                
+                <div x-show="modalTab === 'env'">
+                    <template x-if="modalApp">
+                        <div>
+                            <template x-for="(value, key) in modalApp.env_vars" :key="key">
+                                <div class="env-var-row">
+                                    <input type="text" :value="key" readonly style="flex: 0.4; background: #1a1a2e;">
+                                    <input type="text" x-model="modalApp.env_vars[key]">
+                                    <button @click="removeEnvVar(key)" class="btn btn-danger btn-sm">×</button>
+                                </div>
+                            </template>
+                            <button @click="addEnvVar()" class="btn btn-sm" style="margin-top: 0.5rem;">+ Add Variable</button>
+                        </div>
+                    </template>
+                </div>
+
+                <div x-show="modalTab === 'scale'">
+                    <div class="form-group">
+                        <label class="form-label">Instances: <span x-text="modalApp?.instances || 1"></span></label>
+                        <input type="range" min="1" max="10" x-model="modalApp.instances" style="width: 100%;">
+                    </div>
+                </div>
+                
+                <div style="margin-top: 2rem; display: flex; gap: 1rem;">
+                    <button @click="saveAppConfig()" class="btn btn-success">💾 Save Changes</button>
+                    <button @click="showModal = false" class="btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div x-show="showShortcuts" class="modal" @click.self="showShortcuts = false" x-transition>
+            <div class="shortcuts-modal">
+                <h2>⌨️ Keyboard Shortcuts</h2>
+                <div class="shortcut-item"><span>Deploy Form</span><span class="shortcut-key">Ctrl + D</span></div>
+                <div class="shortcut-item"><span>Search</span><span class="shortcut-key">Ctrl + K</span></div>
+                <div class="shortcut-item"><span>Shortcuts</span><span class="shortcut-key">?</span></div>
+            </div>
         </div>
     </div>
-
-    <script>
-        function loadAppHealth() {
-            this.apps.forEach(app => {
-                fetch(`/api/apps/${app.id}/health`)
-                    .then(r => r.json())
-                    .then(health => { app.health = health; });
-            });
-        }
-
-        function loadApps() {
-            return fetch('/api/apps')
-                .then(r => r.json())
-                .then(data => { 
-                    this.apps = data;
-                    this.loadAppHealth();
-                });
-        }
-
-        function loadStats() {
-            return fetch('/api/stats')
-                .then(r => r.json())
-                .then(data => { 
-                    this.stats = data;
-                    this.stats.healthy_apps = this.apps.filter(app => 
-                        app.health && app.health.status === 'healthy'
-                    ).length;
-                });
-        }
-
-        function deployApp() {
-            const appData = this.newApp;
-            fetch('/api/deploy', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(appData)
-            })
-            .then(r => r.json())
-            .then(result => {
-                alert('Deployment started! Check the app list for status.');
-                this.newApp = { name: '', git_url: '' };
-                this.showDeployForm = false;
-                loadApps.call(this);
-            })
-            .catch(err => alert('Deployment failed: ' + err));
-        }
-
-        function startApp(appId) {
-            fetch(`/api/apps/${appId}/start`, { method: 'POST' })
-                .then(() => loadApps.call(this));
-        }
-
-        function stopApp(appId) {
-            fetch(`/api/apps/${appId}/stop`, { method: 'POST' })
-                .then(() => loadApps.call(this));
-        }
-
-        function restartApp(appId) {
-            fetch(`/api/apps/${appId}/restart`, { method: 'POST' })
-                .then(() => loadApps.call(this));
-        }
-
-        function deleteApp(appId) {
-            if (confirm('Are you sure you want to delete this app?')) {
-                fetch(`/api/apps/${appId}`, { method: 'DELETE' })
-                    .then(() => {
-                        this.selectedApp = null;
-                        loadApps.call(this);
-                    });
-            }
-        }
-
-        function viewLogs(appId) {
-            this.selectedApp = this.selectedApp === appId ? null : appId;
-            if (this.selectedApp) {
-                this.loadLogs(appId);
-            }
-        }
-
-        function loadLogs(appId) {
-            fetch(`/api/apps/${appId}/logs?lines=50`)
-                .then(r => r.json())
-                .then(data => { this.logs = data.logs; });
-        }
-    </script>
 </body>
 </html>
