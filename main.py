@@ -3,164 +3,329 @@ import uuid
 import json
 import asyncio
 import subprocess
+import secrets
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Depends
+# Security imports
+import bcrypt
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+import redis.asyncio as redis
+from pydantic import BaseModel, EmailStr, validator
 import docker
 from docker.models.containers import Container
-from flask import jsonify, request
-import psutil
-import asyncio
-from datetime import datetime
-# Database imports
 from sqlalchemy.orm import Session
-from database import get_db, User, App, APIKey
+from database import get_db, User, App, APIKey, AuditLog
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
-# Configuration
+# ===== CONFIGURATION =====
 CONFIG = {
     "domain": os.getenv("PLATFORM_DOMAIN", "localhost"),
     "docker_network": "mini-cloud-network",
     "data_volume": "mini-cloud-data",
-    "port_range_start": 10000
+    "port_range_start": 10000,
+    "jwt_secret": os.getenv("SECRET_KEY", secrets.token_urlsafe(64)),
+    "jwt_algorithm": "HS256",
+    "jwt_expire_minutes": 60,
+    "docker_host": os.getenv("DOCKER_HOST", "tcp://docker-socket:2375")
 }
-# Initialize Docker client
+
+# Security
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+
+# Redis for rate limiting and caching
+redis_client = None
+
+# Docker client with timeout and retries
 try:
-    docker_client = docker.from_env()
+    docker_client = docker.DockerClient(base_url=CONFIG["docker_host"], timeout=30)
 except:
     docker_client = None
-    
-app = FastAPI(title="Mini Cloud Platform", version="1.0.0")
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Docker client
-docker_client = docker.from_env()
-
-# In-memory storage (fallback during transition)
-apps_db: Dict[str, dict] = {}
-deployments_db: Dict[str, dict] = {}
-
-# Pydantic models
-class DeploymentRequest(BaseModel):
-    name: str
-    git_url: Optional[str] = None
-    environment_variables: Dict[str, str] = {}
-    port: Optional[int] = None
-
-class AppStatus(BaseModel):
-    id: str
-    name: str
-    status: str  # running, stopped, building, error
-    url: str
-    port: int
-    created_at: str
-    git_url: Optional[str] = None
-    container_id: Optional[str] = None
-
+# ===== PYDANTIC MODELS =====
 class UserCreate(BaseModel):
-    email: str
+    email: EmailStr
     password: str
+    
+    @validator('password')
+    def password_strength(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters')
+        if not any(c.isupper() for c in v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not any(c.islower() for c in v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('Password must contain at least one digit')
+        return v
 
 class UserLogin(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+    refresh_token: str
+    expires_in: int
 
-@app.on_event("startup")
-async def startup():
-    """Initialize platform on startup"""
-    print("🚀 Starting Mini Cloud Platform...")
+class DeploymentRequest(BaseModel):
+    name: str
+    git_url: str
+    environment_variables: Dict[str, str] = {}
+    port: Optional[int] = None
+    memory_limit: str = "512M"
+    cpu_limit: str = "0.5"
+
+class AppStatus(BaseModel):
+    id: str
+    name: str
+    status: str
+    url: str
+    port: int
+    created_at: str
+    git_url: Optional[str] = None
+    container_id: Optional[str] = None
+    memory_usage: Optional[str] = None
+    cpu_usage: Optional[str] = None
+
+# ===== SECURITY FUNCTIONS =====
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=CONFIG["jwt_expire_minutes"])
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, CONFIG["jwt_secret"], algorithm=CONFIG["jwt_algorithm"])
+    return encoded_jwt
+
+def create_refresh_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=7)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, CONFIG["jwt_secret"], algorithm=CONFIG["jwt_algorithm"])
+    return encoded_jwt
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, CONFIG["jwt_secret"], algorithms=[CONFIG["jwt_algorithm"]])
+        if payload.get("type") == "refresh":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token not allowed here"
+            )
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"user_id": user_id, "email": payload.get("email")}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def log_audit(db: Session, user_id: str, action: str, details: str = ""):
+    audit_log = AuditLog(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        action=action,
+        details=details,
+        ip_address="",  # Get from request in actual endpoint
+        user_agent=""
+    )
+    db.add(audit_log)
+    db.commit()
+
+# ===== LIFECYCLE =====
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global redis_client
+    redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
+    await FastAPILimiter.init(redis_client)
+    
+    # Initialize Docker network
     try:
         docker_client.networks.get(CONFIG["docker_network"])
-    except docker.errors.NotFound:
-        docker_client.networks.create(
-            CONFIG["docker_network"], 
-            driver="bridge",
-            attachable=True
-        )
-        print(f"✅ Created Docker network: {CONFIG['docker_network']}")
-
-@app.get("/api/apps/{app_id}/health")
-async def check_app_health(app_id: str):
-    if app_id not in apps_db:
-        return {"status": "unknown"}
-    
-    try:
-        container = docker_client.containers.get(apps_db[app_id]["container_id"])
-        # Basic TCP check on app port
-        import socket
-        sock = socket.create_connection(("localhost", apps_db[app_id]["port"]), timeout=2)
-        sock.close()
-        return {"status": "healthy"}
     except:
-        return {"status": "unhealthy"}
+        docker_client.networks.create(CONFIG["docker_network"], driver="bridge")
+    
+    yield
+    
+    # Shutdown
+    if redis_client:
+        await redis_client.close()
 
-@app.get("/")
-async def root():
-    return {"message": "Mini Cloud Platform API", "version": "1.0.0"}
+# Create FastAPI app
+app = FastAPI(title="Mini Cloud Platform", version="2.0.0", lifespan=lifespan)
 
-# 🔐 Authentication Endpoints
+# Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=json.loads(os.getenv("ALLOWED_ORIGINS", '["http://localhost:3000"]')),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=[CONFIG["domain"], f"*.{CONFIG['domain']}"] if CONFIG["domain"] != "localhost" else ["*"]
+)
+
+# Rate limiting error handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ===== AUTH ENDPOINTS =====
 @app.post("/api/auth/register", response_model=Token)
-async def register(user: UserCreate, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def register(
+    request: Request,
+    user: UserCreate, 
+    db: Session = Depends(get_db)
+):
     # Check if user exists
     existing_user = db.query(User).filter(User.email == user.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
     user_id = str(uuid.uuid4())
-    # For demo - in production, use proper password hashing
-    hashed_password = user.password + "_hashed"  
+    hashed_password = get_password_hash(user.password)
     
     db_user = User(
         id=user_id,
         email=user.email,
-        hashed_password=hashed_password
+        hashed_password=hashed_password,
+        is_active=True,
+        created_at=datetime.utcnow()
     )
     db.add(db_user)
     db.commit()
     
-    # For demo - in production, use proper JWT tokens
-    access_token = f"token_{user_id}"
-    return {"access_token": access_token, "token_type": "bearer"}
+    access_token = create_access_token({"sub": user_id, "email": user.email})
+    refresh_token = create_refresh_token({"sub": user_id})
+    
+    log_audit(db, user_id, "user_registered", f"Email: {user.email}")
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": CONFIG["jwt_expire_minutes"] * 60
+    }
 
-# Simple auth dependency (replace with proper JWT in production)
-async def get_current_user():
-    return {"id": "default-user", "email": "user@example.com"}
-
-@app.post("/api/deploy", response_model=dict)
-async def deploy_app(
-    deployment: DeploymentRequest, 
-    background_tasks: BackgroundTasks,
-    current_user: dict = Depends(get_current_user),
+@app.post("/api/auth/login", response_model=Token)
+@limiter.limit("10/minute")
+async def login(
+    request: Request,
+    user: UserLogin, 
     db: Session = Depends(get_db)
 ):
-    """Deploy a new application"""
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not db_user.is_active:
+        raise HTTPException(status_code=403, detail="Account deactivated")
+    
+    access_token = create_access_token({"sub": db_user.id, "email": db_user.email})
+    refresh_token = create_refresh_token({"sub": db_user.id})
+    
+    log_audit(db, db_user.id, "user_login", "Successful login")
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": CONFIG["jwt_expire_minutes"] * 60
+    }
+
+@app.post("/api/auth/refresh", response_model=Token)
+async def refresh_token(
+    refresh_token: str,
+    db: Session = Depends(get_db)
+):
+    try:
+        payload = jwt.decode(refresh_token, CONFIG["jwt_secret"], algorithms=[CONFIG["jwt_algorithm"]])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        
+        user_id = payload.get("sub")
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=401, detail="User not found or inactive")
+        
+        new_access_token = create_access_token({"sub": user.id, "email": user.email})
+        new_refresh_token = create_refresh_token({"sub": user.id})
+        
+        return {
+            "access_token": new_access_token,
+            "refresh_token": new_refresh_token,
+            "token_type": "bearer",
+            "expires_in": CONFIG["jwt_expire_minutes"] * 60
+        }
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+# ===== APP DEPLOYMENT =====
+@app.post("/api/deploy", response_model=dict)
+@limiter.limit("3/minute")
+async def deploy_app(
+    request: Request,
+    deployment: DeploymentRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    # Validate Git URL
+    if not deployment.git_url.startswith(("http://", "https://", "git@")):
+        raise HTTPException(status_code=400, detail="Invalid Git URL")
+    
+    # Check for duplicate app names
+    existing_app = db.query(App).filter(
+        App.name == deployment.name,
+        App.user_id == current_user["user_id"]
+    ).first()
+    if existing_app:
+        raise HTTPException(status_code=400, detail="App with this name already exists")
+    
     app_id = str(uuid.uuid4())[:8]
-    port = deployment.port or (CONFIG["port_range_start"] + len(apps_db))
+    
+    # Determine port
+    last_app = db.query(App).order_by(App.port.desc()).first()
+    port = deployment.port or (CONFIG["port_range_start"] + (last_app.port if last_app else 0))
     
     # Generate subdomain
     if CONFIG["domain"] == "localhost":
         url = f"http://localhost:{port}"
         subdomain = f"localhost:{port}"
     else:
-        subdomain = deployment.name.lower().replace(" ", "-")
+        subdomain = f"{deployment.name.lower().replace(' ', '-')}-{app_id}"
         url = f"https://{subdomain}.{CONFIG['domain']}"
-
+    
     # Create app in database
     db_app = App(
         id=app_id,
@@ -170,197 +335,241 @@ async def deploy_app(
         port=port,
         git_url=deployment.git_url,
         environment_variables=json.dumps(deployment.environment_variables),
-        user_id=current_user["id"]
+        user_id=current_user["user_id"],
+        memory_limit=deployment.memory_limit,
+        cpu_limit=deployment.cpu_limit,
+        created_at=datetime.utcnow()
     )
     db.add(db_app)
     db.commit()
-
-    # Also keep in memory for backward compatibility
-    app_data = {
-        "id": app_id,
-        "name": deployment.name,
-        "status": "building",
-        "url": url,
-        "port": port,
-        "git_url": deployment.git_url,
-        "environment_variables": deployment.environment_variables,
-        "created_at": datetime.now().isoformat(),
-        "container_id": None,
-        "subdomain": subdomain,
-        "user_id": current_user["id"]
-    }
     
-    apps_db[app_id] = app_data
-    background_tasks.add_task(deploy_app_background, app_id, deployment, subdomain, db)
+    # Start deployment in background
+    background_tasks.add_task(
+        deploy_app_background,
+        app_id, deployment, subdomain, current_user["user_id"], db
+    )
+    
+    log_audit(db, current_user["user_id"], "app_deploy_started", f"App: {deployment.name}")
     
     return {
-        "app_id": app_id, 
-        "status": "building", 
+        "app_id": app_id,
+        "status": "building",
         "url": url,
-        "message": "Deployment started"
+        "message": "Deployment started",
+        "estimated_time": "2-5 minutes"
     }
 
-async def deploy_app_background(app_id: str, deployment: DeploymentRequest, subdomain: str, db: Session):
-    try:
-        app_data = apps_db[app_id]
-        print(f"🛠️ Building app: {app_data['name']} ({app_id})")
-        if deployment.git_url:
-            await build_from_git(app_id, deployment, subdomain, db)
-        else:
-            raise HTTPException(400, "Only Git deployment supported in this version")
-    except Exception as e:
-        apps_db[app_id]["status"] = "error"
-        apps_db[app_id]["error"] = str(e)
-        
-        # Update database
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db_app.status = "error"
-            db.commit()
-        
-        print(f"❌ Deployment failed for {app_id}: {e}")
-
-def create_app_container(app_id: str, image_tag: str, environment_vars: dict, port: int, subdomain: str):
-    """Create container with SSL labels"""
+async def deploy_app_background(app_id: str, deployment: DeploymentRequest, subdomain: str, user_id: str, db: Session):
+    app = db.query(App).filter(App.id == app_id).first()
+    if not app:
+        return
     
-    # SSL labels for Traefik
-    labels = {
-        "traefik.enable": "true",
-        f"traefik.http.routers.app-{app_id}.rule": f"Host(`{subdomain}.{CONFIG['domain']}`)",
-        f"traefik.http.routers.app-{app_id}.entrypoints": "websecure",
-        f"traefik.http.routers.app-{app_id}.tls.certresolver": "myresolver",
-        f"traefik.http.services.app-{app_id}.loadbalancer.server.port": str(port)
-    }
-    
-    # Add resource limits for production
-    resource_limits = {
-        "memory": "512M",
-        "memory_reservation": "256M",
-        "nano_cpus": 500000000,
-        "cpu_period": 100000,
-        "cpu_quota": 50000,
-    }
-
-    security_opt = ["no-new-privileges:true"]
-
-    container = docker_client.containers.run(
-        image_tag,
-        detach=True,
-        name=f"app-{app_id}",
-        network=CONFIG["docker_network"],
-        environment=environment_vars,
-        labels=labels,
-        ports={f"{port}/tcp": port} if CONFIG["domain"] == "localhost" else {},
-        mem_limit=resource_limits["memory"],
-        mem_reservation=resource_limits["memory_reservation"],
-        cpu_period=resource_limits["cpu_period"],
-        cpu_quota=resource_limits["cpu_quota"],
-        security_opt=security_opt,
-        restart_policy={"Name": "on-failure", "MaximumRetryCount": 3},
-    )
-    return container
-
-async def build_from_git(app_id: str, deployment: DeploymentRequest, subdomain: str, db: Session):
-    app_data = apps_db[app_id]
     try:
+        print(f"🛠️ Building app: {app.name} ({app_id})")
+        
+        # Clone repo
         build_path = f"/tmp/builds/{app_id}"
         os.makedirs(build_path, exist_ok=True)
         
-        print(f"📥 Cloning {deployment.git_url}...")
         result = subprocess.run(
-            ["git", "clone", deployment.git_url, build_path],
+            ["git", "clone", "--depth", "1", deployment.git_url, build_path],
             capture_output=True, text=True, timeout=300
         )
         
         if result.returncode != 0:
             raise Exception(f"Git clone failed: {result.stderr}")
         
+        # Check for Dockerfile, create if missing
         dockerfile_path = os.path.join(build_path, "Dockerfile")
         if not os.path.exists(dockerfile_path):
             await generate_dockerfile(build_path)
         
-        image_tag = f"mini-cloud-app-{app_id}:latest"
+        # Build Docker image
+        image_tag = f"mini-cloud-app-{app_id}:{secrets.token_hex(8)}"
         print(f"🐳 Building Docker image: {image_tag}")
-        image, logs = docker_client.images.build(path=build_path, tag=image_tag, rm=True)
         
-        environment_vars = {**app_data["environment_variables"], "PORT": str(app_data["port"])}
-        container = create_app_container(app_id, image_tag, environment_vars, app_data["port"], subdomain)
+        build_logs = []
+        for line in docker_client.images.build(
+            path=build_path,
+            tag=image_tag,
+            rm=True,
+            forcerm=True,
+            buildargs=deployment.environment_variables,
+            network_mode=CONFIG["docker_network"],
+            pull=True
+        ):
+            if 'stream' in line:
+                log_line = line['stream'].strip()
+                if log_line:
+                    build_logs.append(log_line)
+                    print(log_line)
         
-        # Update both memory and database
-        apps_db[app_id]["status"] = "running"
-        apps_db[app_id]["container_id"] = container.id
+        # Create container
+        environment_vars = {
+            **deployment.environment_variables,
+            "PORT": str(app.port),
+            "APP_ID": app_id
+        }
         
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db_app.status = "running"
-            db_app.container_id = container.id
-            db.commit()
+        container = docker_client.containers.run(
+            image_tag,
+            detach=True,
+            name=f"app-{app_id}",
+            network=CONFIG["docker_network"],
+            environment=environment_vars,
+            labels={
+                "traefik.enable": "true",
+                f"traefik.http.routers.app-{app_id}.rule": f"Host(`{subdomain}.{CONFIG['domain']}`)",
+                f"traefik.http.routers.app-{app_id}.entrypoints": "websecure",
+                f"traefik.http.routers.app-{app_id}.tls.certresolver": "myresolver",
+                f"traefik.http.services.app-{app_id}.loadbalancer.server.port": str(app.port),
+                "com.minicloud.user_id": user_id,
+                "com.minicloud.app_id": app_id
+            },
+            mem_limit=deployment.memory_limit,
+            mem_reservation=deployment.memory_limit.replace("M", "").replace("G", "") + "M",
+            cpu_period=100000,
+            cpu_quota=int(float(deployment.cpu_limit) * 100000),
+            security_opt=["no-new-privileges:true"],
+            restart_policy={"Name": "on-failure", "MaximumRetryCount": 3},
+            healthcheck={
+                "test": ["CMD", "curl", "-f", f"http://localhost:{app.port}/health || exit 1"],
+                "interval": 30000000000,
+                "timeout": 5000000000,
+                "retries": 3
+            }
+        )
         
-        print(f"✅ Successfully deployed {app_data['name']} at {app_data['url']}")
+        # Update database
+        app.status = "running"
+        app.container_id = container.id
+        app.image_tag = image_tag
+        app.updated_at = datetime.utcnow()
+        db.commit()
+        
+        print(f"✅ Successfully deployed {app.name} at {app.url}")
+        log_audit(db, user_id, "app_deployed", f"App: {app.name}, Container: {container.id}")
+        
+    except subprocess.TimeoutExpired:
+        app.status = "error"
+        app.error_message = "Build timeout (5 minutes exceeded)"
+        db.commit()
+        log_audit(db, user_id, "app_deploy_failed", f"App: {app.name} - Timeout")
+        
     except Exception as e:
-        apps_db[app_id]["status"] = "error"
-        apps_db[app_id]["error"] = str(e)
+        app.status = "error"
+        app.error_message = str(e)
+        db.commit()
+        print(f"❌ Deployment failed for {app_id}: {e}")
+        log_audit(db, user_id, "app_deploy_failed", f"App: {app.name} - {str(e)}")
         
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db_app.status = "error"
-            db.commit()
-        raise
+        # Cleanup
+        try:
+            subprocess.run(["rm", "-rf", f"/tmp/builds/{app_id}"])
+        except:
+            pass
 
 async def generate_dockerfile(build_path: str):
     if os.path.exists(os.path.join(build_path, "package.json")):
-        dockerfile_content = """
-FROM node:18-alpine
+        dockerfile_content = """FROM node:18-alpine
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+RUN npm ci --only=production
 COPY . .
+RUN npm run build --if-present
+USER node
 EXPOSE 3000
 CMD ["npm", "start"]
 """
     elif os.path.exists(os.path.join(build_path, "requirements.txt")):
-        dockerfile_content = """
-FROM python:3.11-slim
+        dockerfile_content = """FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
 EXPOSE 8000
 CMD ["python", "app.py"]
 """
+    elif os.path.exists(os.path.join(build_path, "go.mod")):
+        dockerfile_content = """FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/main .
+EXPOSE 8080
+CMD ["./main"]
+"""
     else:
-        dockerfile_content = """
-FROM nginx:alpine
+        dockerfile_content = """FROM nginx:alpine
 COPY . /usr/share/nginx/html
 EXPOSE 80
 """
+    
     with open(os.path.join(build_path, "Dockerfile"), "w") as f:
         f.write(dockerfile_content)
 
+# ===== APP MANAGEMENT =====
 @app.get("/api/apps", response_model=List[AppStatus])
+@limiter.limit("30/minute")
 async def list_apps(
-    current_user: dict = Depends(get_current_user),
+    request: Request,
+    current_user: dict = Depends(verify_token),
     db: Session = Depends(get_db)
 ):
-    """Get apps from database for current user"""
-    apps = db.query(App).filter(App.user_id == current_user["id"]).all()
-    return [AppStatus(
-        id=app.id,
-        name=app.name,
-        status=app.status,
-        url=app.url,
-        port=app.port,
-        git_url=app.git_url,
-        container_id=app.container_id,
-        created_at=app.created_at.isoformat()
-    ) for app in apps]
+    apps = db.query(App).filter(App.user_id == current_user["user_id"]).order_by(App.created_at.desc()).all()
+    
+    result = []
+    for app in apps:
+        # Get container stats if running
+        memory_usage = cpu_usage = None
+        if app.container_id and app.status == "running":
+            try:
+                container = docker_client.containers.get(app.container_id)
+                stats = container.stats(stream=False)
+                memory_usage = stats['memory_stats']['usage']
+                cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - stats['precpu_stats']['cpu_usage']['total_usage']
+                system_delta = stats['cpu_stats']['system_cpu_usage'] - stats['precpu_stats']['system_cpu_usage']
+                cpu_usage = (cpu_delta / system_delta * 100) if system_delta > 0 else 0
+            except:
+                pass
+        
+        result.append(AppStatus(
+            id=app.id,
+            name=app.name,
+            status=app.status,
+            url=app.url,
+            port=app.port,
+            git_url=app.git_url,
+            container_id=app.container_id,
+            created_at=app.created_at.isoformat(),
+            memory_usage=str(memory_usage) if memory_usage else None,
+            cpu_usage=f"{cpu_usage:.2f}%" if cpu_usage else None
+        ))
+    
+    return result
 
 @app.get("/api/apps/{app_id}", response_model=AppStatus)
-async def get_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Get specific app from database"""
-    app = db.query(App).filter(App.id == app_id, App.user_id == current_user["id"]).first()
+async def get_app(
+    app_id: str,
+    current_user: dict = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    app = db.query(App).filter(
+        App.id == app_id,
+        App.user_id == current_user["user_id"]
+    ).first()
+    
     if not app:
-        raise HTTPException(404, "App not found")
+        raise HTTPException(status_code=404, detail="App not found")
+    
     return AppStatus(
         id=app.id,
         name=app.name,
@@ -373,602 +582,194 @@ async def get_app(app_id: str, current_user: dict = Depends(get_current_user), d
     )
 
 @app.post("/api/apps/{app_id}/start")
-async def start_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
-        raise HTTPException(404, "App not found")
-    app_data = apps_db[app_id]
-    if not app_data["container_id"]:
-        raise HTTPException(400, "App not deployed properly")
+@limiter.limit("10/minute")
+async def start_app(
+    request: Request,
+    app_id: str,
+    current_user: dict = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    app = db.query(App).filter(
+        App.id == app_id,
+        App.user_id == current_user["user_id"]
+    ).first()
+    
+    if not app or not app.container_id:
+        raise HTTPException(status_code=404, detail="App not found")
+    
     try:
-        container = docker_client.containers.get(app_data["container_id"])
+        container = docker_client.containers.get(app.container_id)
         container.start()
-        apps_db[app_id]["status"] = "running"
+        app.status = "running"
+        app.updated_at = datetime.utcnow()
+        db.commit()
         
-        # Update database
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db_app.status = "running"
-            db.commit()
-            
+        log_audit(db, current_user["user_id"], "app_started", f"App: {app.name}")
         return {"status": "success", "message": "App started"}
+        
     except Exception as e:
-        raise HTTPException(500, f"Failed to start app: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start app: {str(e)}")
 
 @app.post("/api/apps/{app_id}/stop")
-async def stop_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
-        raise HTTPException(404, "App not found")
-    app_data = apps_db[app_id]
-    if not app_data["container_id"]:
-        raise HTTPException(400, "App not deployed properly")
+@limiter.limit("10/minute")
+async def stop_app(
+    request: Request,
+    app_id: str,
+    current_user: dict = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    app = db.query(App).filter(
+        App.id == app_id,
+        App.user_id == current_user["user_id"]
+    ).first()
+    
+    if not app or not app.container_id:
+        raise HTTPException(status_code=404, detail="App not found")
+    
     try:
-        container = docker_client.containers.get(app_data["container_id"])
-        container.stop()
-        apps_db[app_id]["status"] = "stopped"
+        container = docker_client.containers.get(app.container_id)
+        container.stop(timeout=10)
+        app.status = "stopped"
+        app.updated_at = datetime.utcnow()
+        db.commit()
         
-        # Update database
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db_app.status = "stopped"
-            db.commit()
-            
+        log_audit(db, current_user["user_id"], "app_stopped", f"App: {app.name}")
         return {"status": "success", "message": "App stopped"}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to stop app: {str(e)}")
-
-@app.post("/api/apps/{app_id}/restart")
-async def restart_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
-        raise HTTPException(404, "App not found")
-    app_data = apps_db[app_id]
-    if not app_data["container_id"]:
-        raise HTTPException(400, "App not deployed properly")
-    try:
-        container = docker_client.containers.get(app_data["container_id"])
-        container.restart()
-        apps_db[app_id]["status"] = "running"
         
-        # Update database
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db_app.status = "running"
-            db.commit()
-            
-        return {"status": "success", "message": "App restarted"}
     except Exception as e:
-        raise HTTPException(500, f"Failed to restart app: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop app: {str(e)}")
 
 @app.delete("/api/apps/{app_id}")
-async def delete_app(app_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
-        raise HTTPException(404, "App not found")
-    app_data = apps_db[app_id]
-    try:
-        if app_data["container_id"]:
-            container = docker_client.containers.get(app_data["container_id"])
-            container.stop()
-            container.remove()
-        image_tag = f"mini-cloud-app-{app_id}:latest"
-        try:
-            docker_client.images.remove(image_tag)
-        except:
-            pass
-        
-        # Remove from database
-        db_app = db.query(App).filter(App.id == app_id).first()
-        if db_app:
-            db.delete(db_app)
-            db.commit()
-            
-        # Remove from memory
-        del apps_db[app_id]
-        
-        return {"status": "success", "message": "App deleted"}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to delete app: {str(e)}")
-
-@app.get("/api/apps/{app_id}/logs")
-async def get_app_logs(app_id: str, current_user: dict = Depends(get_current_user)):
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
-        raise HTTPException(404, "App not found")
-    app_data = apps_db[app_id]
-    if not app_data["container_id"]:
-        raise HTTPException(400, "App not deployed properly")
-    try:
-        container = docker_client.containers.get(app_data["container_id"])
-        logs = container.logs(tail=100).decode('utf-8')
-        return {"logs": logs}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to get logs: {str(e)}")
-
-@app.get("/api/stats")
-async def get_platform_stats(db: Session = Depends(get_db)):
-    total_apps = db.query(App).count()
-    running_apps = db.query(App).filter(App.status == "running").count()
-    return {
-        "total_apps": total_apps,
-        "running_apps": running_apps,
-        "stopped_apps": total_apps - running_apps,
-        "domain": CONFIG["domain"],
-        "uptime": "0"
-    }
-
-@app.get("/api/apps/{app_id}/stats")
-async def get_app_stats(app_id: str, current_user: dict = Depends(get_current_user)):
-    """Get resource usage statistics for an app"""
-    if app_id not in apps_db or apps_db[app_id].get("user_id") != current_user["id"]:
-        raise HTTPException(404, "App not found")
-    
-    try:
-        container = docker_client.containers.get(apps_db[app_id]["container_id"])
-        stats = container.stats(stream=False)
-        
-        # Parse Docker stats
-        cpu_stats = stats["cpu_stats"]
-        memory_stats = stats["memory_stats"]
-        
-        return {
-            "cpu_usage": calculate_cpu_percent(cpu_stats),
-            "memory_usage": memory_stats.get("usage", 0),
-            "memory_limit": memory_stats.get("limit", 0),
-            "network_io": stats["networks"],
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        raise HTTPException(500, f"Failed to get stats: {str(e)}")
-
-def calculate_cpu_percent(cpu_stats):
-    """Calculate CPU percentage from Docker stats"""
-    cpu_delta = cpu_stats["cpu_usage"]["total_usage"] - cpu_stats["precpu_usage"]["total_usage"]
-    system_delta = cpu_stats["system_cpu_usage"] - cpu_stats["precpu_usage"]["system_cpu_usage"]
-    
-    if system_delta > 0 and cpu_delta > 0:
-        return (cpu_delta / system_delta) * 100.0
-    return 0.0
-
-# Metrics endpoint
-@app.get("/metrics")
-async def metrics():
-    """Prometheus-style metrics endpoint"""
-    metrics_data = []
-    
-    # Platform metrics
-    metrics_data.append(f"mini_cloud_apps_total {len(apps_db)}")
-    metrics_data.append(f"mini_cloud_apps_running {len([app for app in apps_db.values() if app.get('status') == 'running'])}")
-    
-    # User metrics (if database is active)
-    try:
-        # This would need to be adjusted based on your actual users storage
-        users_total = 0  # Placeholder
-        metrics_data.append(f"mini_cloud_users_total {users_total}")
-    except:
-        metrics_data.append("mini_cloud_users_total 0")
-    
-    # Docker metrics
-    try:
-        containers = docker_client.containers.list()
-        metrics_data.append(f"mini_cloud_containers_total {len(containers)}")
-        running_containers = len([c for c in containers if c.status == "running"])
-        metrics_data.append(f"mini_cloud_containers_running {running_containers}")
-    except Exception:
-        metrics_data.append("mini_cloud_docker_errors 1")
-    
-    return Response(content="\n".join(metrics_data), media_type="text/plain")
-
-# Backup endpoints
-@app.post("/api/admin/backup")
-async def trigger_backup(
-    current_user: dict = Depends(get_current_user),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+@limiter.limit("5/minute")
+async def delete_app(
+    request: Request,
+    app_id: str,
+    current_user: dict = Depends(verify_token),
+    db: Session = Depends(get_db)
 ):
-    """Trigger manual backup (admin only)"""
-    # Check if user is admin (you'd implement proper admin check)
-    background_tasks.add_task(perform_full_backup)
-    return {"status": "success", "message": "Backup started"}
-
-@app.get("/api/admin/backups")
-async def list_backups(current_user: dict = Depends(get_current_user)):
-    """List available backups"""
-    backup_files = []
-    backup_dir = "/app/backups"
+    app = db.query(App).filter(
+        App.id == app_id,
+        App.user_id == current_user["user_id"]
+    ).first()
     
-    if os.path.exists(backup_dir):
-        for filename in os.listdir(backup_dir):
-            filepath = os.path.join(backup_dir, filename)
-            if os.path.isfile(filepath):
-                backup_files.append({
-                    "name": filename,
-                    "size": os.path.getsize(filepath),
-                    "created": datetime.fromtimestamp(os.path.getctime(filepath)).isoformat()
-                })
-    
-    return {"backups": backup_files}
-
-def perform_full_backup():
-    """Perform full platform backup"""
-    os.makedirs("/app/backups", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = f"/app/backups/backup_{timestamp}.tar.gz"
+    if not app:
+        raise HTTPException(status_code=404, detail="App not found")
     
     try:
-        subprocess.run(
-            ["tar", "-czf", backup_path, "/app/data", "/tmp/builds"],
-            check=True
-        )
-        print(f"✅ Backup created: {backup_path}")
-    except Exception as e:
-        print(f"❌ Backup failed: {e}")
-
-# Static files
-app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="dashboard")
-
-@app.get("/dashboard")
-async def serve_dashboard():
-    return FileResponse('dashboard/index.html')
-
-
-# --- 1. App Health Check ---
-@app.route('/api/apps/<app_id>/health', methods=['GET'])
-def app_health(app_id):
-    """Check if app container is responding"""
-    try:
-        if not docker_client:
-            return jsonify({"status": "unknown", "message": "Docker unavailable"}), 503
-        
-        container = docker_client.containers.get(app_id)
-        
-        if container.status == 'running':
-            # Try to ping the app's health endpoint
+        # Stop and remove container
+        if app.container_id:
             try:
-                import requests
-                response = requests.get(f"http://localhost:{container.attrs['NetworkSettings']['Ports']['80/tcp'][0]['HostPort']}/health", timeout=2)
-                return jsonify({"status": "healthy", "response_time": response.elapsed.total_seconds()})
-            except:
-                return jsonify({"status": "unhealthy", "message": "Not responding"})
-        else:
-            return jsonify({"status": "stopped"})
-    
-    except docker.errors.NotFound:
-        return jsonify({"status": "not_found"}), 404
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# --- 2. Platform Stats ---
-@app.route('/api/stats', methods=['GET'])
-def platform_stats():
-    """Get overall platform statistics"""
-    try:
-        if not docker_client:
-            return jsonify({
-                "total_apps": 0,
-                "running_apps": 0,
-                "healthy_apps": 0
-            })
-        
-        containers = docker_client.containers.list(all=True)
-        running = [c for c in containers if c.status == 'running']
-        
-        # Count healthy apps (simplified)
-        healthy = len(running)  # In production, ping each app
-        
-        return jsonify({
-            "total_apps": len(containers),
-            "running_apps": len(running),
-            "healthy_apps": healthy,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# --- 3. App Logs ---
-@app.route('/api/apps/<app_id>/logs', methods=['GET'])
-def app_logs(app_id):
-    """Get container logs"""
-    try:
-        lines = request.args.get('lines', 50, type=int)
-        
-        if not docker_client:
-            return jsonify({"logs": "Docker unavailable"}), 503
-        
-        container = docker_client.containers.get(app_id)
-        logs = container.logs(tail=lines, timestamps=True).decode('utf-8')
-        
-        return jsonify({
-            "logs": logs,
-            "lines": lines,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
-    except docker.errors.NotFound:
-        return jsonify({"error": "Container not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# --- 4. Restart App ---
-@app.route('/api/apps/<app_id>/restart', methods=['POST'])
-def restart_app(app_id):
-    """Restart application container"""
-    try:
-        if not docker_client:
-            return jsonify({"error": "Docker unavailable"}), 503
-        
-        container = docker_client.containers.get(app_id)
-        container.restart(timeout=10)
-        
-        log_audit(session.get('user_email', 'system'), 'app_restart', 
-                 details=f"App: {app_id}")
-        
-        return jsonify({
-            "ok": True,
-            "message": "App restarted",
-            "app_id": app_id,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
-    except docker.errors.NotFound:
-        return jsonify({"error": "Container not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# --- 5. App Metrics (CPU/RAM) ---
-@app.route('/api/apps/<app_id>/metrics', methods=['GET'])
-def app_metrics(app_id):
-    """Get real-time CPU and memory usage"""
-    try:
-        if not docker_client:
-            return jsonify({"error": "Docker unavailable"}), 503
-        
-        container = docker_client.containers.get(app_id)
-        
-        if container.status != 'running':
-            return jsonify({
-                "cpu_percent": 0,
-                "memory_percent": 0,
-                "status": "stopped"
-            })
-        
-        # Get container stats
-        stats = container.stats(stream=False)
-        
-        # Calculate CPU percentage
-        cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - \
-                    stats['precpu_stats']['cpu_usage']['total_usage']
-        system_delta = stats['cpu_stats']['system_cpu_usage'] - \
-                       stats['precpu_stats']['system_cpu_usage']
-        cpu_percent = (cpu_delta / system_delta) * 100.0 if system_delta > 0 else 0
-        
-        # Calculate memory percentage
-        memory_usage = stats['memory_stats']['usage']
-        memory_limit = stats['memory_stats']['limit']
-        memory_percent = (memory_usage / memory_limit) * 100.0 if memory_limit > 0 else 0
-        
-        return jsonify({
-            "cpu_percent": round(cpu_percent, 2),
-            "memory_percent": round(memory_percent, 2),
-            "memory_mb": round(memory_usage / (1024 * 1024), 2),
-            "status": "running",
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
-    except docker.errors.NotFound:
-        return jsonify({"error": "Container not found"}), 404
-    except Exception as e:
-        logger.error(f"Metrics error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# --- 6. WebSocket for Real-time Deploy Logs ---
-# Note: Requires flask-socketio
-from flask_socketio import SocketIO, emit
-
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-@socketio.on('subscribe_deploy')
-def handle_deploy_subscription(data):
-    """Subscribe to deployment logs"""
-    app_id = data.get('app_id')
-    # Join room for this deployment
-    from flask_socketio import join_room
-    join_room(f"deploy_{app_id}")
-    emit('subscribed', {'app_id': app_id})
-
-def stream_deploy_logs(app_id, log_line):
-    """Emit logs to subscribed clients"""
-    socketio.emit('deploy_log', {
-        'app_id': app_id,
-        'log': log_line,
-        'timestamp': datetime.utcnow().isoformat()
-    }, room=f"deploy_{app_id}")
-
-
-# --- 7. Quick Deploy Templates ---
-@app.route('/api/templates', methods=['GET'])
-def get_templates():
-    """Get pre-configured deployment templates"""
-    templates = [
-        {
-            "id": "nodejs",
-            "name": "Node.js API",
-            "icon": "📦",
-            "description": "Express.js REST API with MongoDB",
-            "git_url": "https://github.com/example/nodejs-api-template",
-            "env_vars": {
-                "NODE_ENV": "production",
-                "PORT": "3000"
-            },
-            "buildpack": "nodejs"
-        },
-        {
-            "id": "flask",
-            "name": "Python Flask",
-            "icon": "🐍",
-            "description": "Flask web application with PostgreSQL",
-            "git_url": "https://github.com/example/flask-template",
-            "env_vars": {
-                "FLASK_ENV": "production",
-                "PORT": "5000"
-            },
-            "buildpack": "python"
-        },
-        {
-            "id": "static",
-            "name": "Static Site",
-            "icon": "📄",
-            "description": "HTML/CSS/JS static website",
-            "git_url": "https://github.com/example/static-template",
-            "env_vars": {},
-            "buildpack": "static"
-        },
-        {
-            "id": "wordpress",
-            "name": "WordPress",
-            "icon": "📝",
-            "description": "WordPress CMS with MySQL",
-            "git_url": "https://github.com/example/wordpress-template",
-            "env_vars": {
-                "WORDPRESS_DB_HOST": "db",
-                "WORDPRESS_DB_USER": "wordpress"
-            },
-            "buildpack": "php"
-        }
-    ]
-    
-    return jsonify(templates)
-
-
-# --- 8. Bulk Start Apps ---
-@app.route('/api/bulk/start', methods=['POST'])
-@limiter.limit("10 per minute")
-def bulk_start_apps():
-    """Start multiple apps at once"""
-    try:
-        data = request.get_json()
-        app_ids = data.get('app_ids', [])
-        
-        if not app_ids:
-            return jsonify({"error": "No app IDs provided"}), 400
-        
-        if len(app_ids) > 20:
-            return jsonify({"error": "Max 20 apps at once"}), 400
-        
-        results = []
-        for app_id in app_ids:
-            try:
-                container = docker_client.containers.get(app_id)
-                container.start()
-                results.append({"app_id": app_id, "status": "started"})
-            except Exception as e:
-                results.append({"app_id": app_id, "error": str(e)})
-        
-        log_audit(session.get('user_email', 'system'), 'bulk_start', 
-                 details=f"Started {len(app_ids)} apps")
-        
-        return jsonify({
-            "ok": True,
-            "results": results,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# --- 9. Bulk Stop Apps ---
-@app.route('/api/bulk/stop', methods=['POST'])
-@limiter.limit("10 per minute")
-def bulk_stop_apps():
-    """Stop multiple apps at once"""
-    try:
-        data = request.get_json()
-        app_ids = data.get('app_ids', [])
-        
-        if not app_ids:
-            return jsonify({"error": "No app IDs provided"}), 400
-        
-        if len(app_ids) > 20:
-            return jsonify({"error": "Max 20 apps at once"}), 400
-        
-        results = []
-        for app_id in app_ids:
-            try:
-                container = docker_client.containers.get(app_id)
+                container = docker_client.containers.get(app.container_id)
                 container.stop(timeout=10)
-                results.append({"app_id": app_id, "status": "stopped"})
-            except Exception as e:
-                results.append({"app_id": app_id, "error": str(e)})
-        
-        log_audit(session.get('user_email', 'system'), 'bulk_stop', 
-                 details=f"Stopped {len(app_ids)} apps")
-        
-        return jsonify({
-            "ok": True,
-            "results": results,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# --- 10. Update App Configuration ---
-@app.route('/api/apps/<app_id>/config', methods=['PUT'])
-def update_app_config(app_id):
-    """Update app environment variables, domain, scaling"""
-    try:
-        data = request.get_json()
-        
-        # Validate input
-        env_vars = data.get('env_vars', {})
-        custom_domain = data.get('custom_domain')
-        instances = data.get('instances', 1)
-        
-        # Update app configuration in database
-        # (Assuming you have an App model)
-        # app = App.query.get(app_id)
-        # app.env_vars = env_vars
-        # app.custom_domain = custom_domain
-        # app.instances = instances
-        # db.session.commit()
-        
-        # Restart container with new config
-        if docker_client:
-            try:
-                container = docker_client.containers.get(app_id)
-                
-                # Update environment variables
-                # Note: You need to recreate container to apply env changes
-                container.stop()
-                # container.remove()
-                # ... recreate with new env vars
-                container.start()
+                container.remove(v=True, force=True)
             except:
                 pass
         
-        log_audit(session.get('user_email', 'system'), 'app_config_update', 
-                 details=f"App: {app_id}")
+        # Remove image
+        if app.image_tag:
+            try:
+                docker_client.images.remove(app.image_tag, force=True)
+            except:
+                pass
         
-        return jsonify({
-            "ok": True,
-            "message": "Configuration updated",
-            "app_id": app_id,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    
+        # Remove build directory
+        try:
+            subprocess.run(["rm", "-rf", f"/tmp/builds/{app_id}"])
+        except:
+            pass
+        
+        # Delete from database
+        db.delete(app)
+        db.commit()
+        
+        log_audit(db, current_user["user_id"], "app_deleted", f"App: {app.name}")
+        return {"status": "success", "message": "App deleted"}
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=f"Failed to delete app: {str(e)}")
 
+# ===== SYSTEM ENDPOINTS =====
+@app.get("/api/system/stats")
+@limiter.limit("60/minute")
+async def system_stats(
+    request: Request,
+    current_user: dict = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    try:
+        # Docker info
+        info = docker_client.info()
+        
+        # Container counts
+        all_containers = docker_client.containers.list(all=True)
+        user_containers = [c for c in all_containers if c.labels.get("com.minicloud.user_id") == current_user["user_id"]]
+        
+        # Platform stats
+        total_apps = db.query(App).filter(App.user_id == current_user["user_id"]).count()
+        running_apps = db.query(App).filter(
+            App.user_id == current_user["user_id"],
+            App.status == "running"
+        ).count()
+        
+        # Resource usage
+        total_memory = info['MemTotal']
+        used_memory = sum(c.attrs['HostConfig']['Memory'] for c in user_containers if 'Memory' in c.attrs['HostConfig'])
+        
+        return {
+            "platform": {
+                "total_apps": total_apps,
+                "running_apps": running_apps,
+                "stopped_apps": total_apps - running_apps
+            },
+            "resources": {
+                "memory": {
+                    "total": total_memory,
+                    "used": used_memory,
+                    "percent": round((used_memory / total_memory * 100), 2) if total_memory > 0 else 0
+                },
+                "cpu_count": info['NCPU'],
+                "docker_version": info['ServerVersion']
+            },
+            "user": {
+                "container_count": len(user_containers),
+                "email": current_user["email"]
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
 
-# If using Flask-SocketIO, add to bottom of file:
-if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+@app.get("/health")
+async def health_check():
+    try:
+        # Check database
+        db = next(get_db())
+        db.execute("SELECT 1")
+        
+        # Check Docker
+        docker_client.ping()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": "2.0.0"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
 
+# ===== STATIC FILES =====
+app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="dashboard")
+app.mount("/", StaticFiles(directory="public", html=True), name="public")
+
+@app.get("/")
+async def serve_dashboard():
+    return FileResponse('public/index.html')
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        proxy_headers=True,
+        forwarded_allow_ips="*"
+    )
