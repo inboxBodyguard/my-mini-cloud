@@ -6,14 +6,14 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - app-data:/app/data
-      - dashboard-data:/app/dashboard
-      - ./config:/app/config  # ✅ Config files instead of docker socket
+      - app-/app/data
+      - dashboard-/app/dashboard
+      - ./config:/app/config
     environment:
       - PLATFORM_DOMAIN=${PLATFORM_DOMAIN}
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
       - SECRET_KEY=${SECRET_KEY}
-      - DOCKER_HOST=tcp://docker-socket:2375  # ✅ Use TCP instead of socket
+      - DOCKER_HOST=tcp://docker-socket:2375
     depends_on:
       - postgres
       - docker-socket
@@ -21,15 +21,17 @@ services:
       - mini-cloud-network
     restart: unless-stopped
 
-  docker-socket:  # ✅ Secure Docker socket proxy
+  docker-socket:
     image: tecnativa/docker-socket-proxy
     environment:
       - CONTAINERS=1
       - IMAGES=1
       - AUTH=1
-      - POST=0  # Disable container creation from API
+      - POST=0
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "2375:2375"  # ✅ FIXED: Expose TCP port
     networks:
       - mini-cloud-network
     restart: unless-stopped
@@ -38,21 +40,21 @@ services:
     image: traefik:v2.10
     command:
       - --api.dashboard=true
-      - --api.insecure=false  # ✅ Secure API
+      - --api.insecure=false
       - --providers.docker=true
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web
-      - --providers.docker.exposedbydefault=false  # ✅ Only expose labeled containers
+      - --providers.docker.exposedbydefault=false
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./config/traefik:/etc/traefik  # ✅ Config files
+      - ./config/traefik:/etc/traefik
       - ./letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - mini-cloud-network
     restart: unless-stopped
@@ -64,7 +66,7 @@ services:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_/var/lib/postgresql/data
       - ./backups:/backups
     networks:
       - mini-cloud-network
@@ -79,11 +81,12 @@ services:
     image: containrrr/watchtower
     restart: unless-stopped
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/watchtower:/var/lib/watchtower  # ✅ FIXED: State persistence
     command: 
       - --cleanup 
-      - --interval 3600  # ✅ Check every hour, not every 5 minutes
-      - --label-enable  # ✅ Only update containers with watchtower label
+      - --interval 3600
+      - --label-enable
     networks:
       - mini-cloud-network
 
@@ -92,9 +95,9 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16  # ✅ Private subnet
+        - subnet: 172.20.0.0/16
 
 volumes:
-  postgres_data:
-  app-data:
-  dashboard-data:
+  postgres_
+  app-
+  dashboard-
