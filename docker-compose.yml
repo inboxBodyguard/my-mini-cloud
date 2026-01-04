@@ -1,4 +1,4 @@
-What’s the error u spot here lemme correct it then I’ll login into my aws server again and recluse my repo and run it again version: '3.8'
+version: '3.8'
 
 services:
   platform:
