@@ -31,7 +31,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
-      - "2375:2375"  # ✅ FIXED: Expose TCP port
+      - "2375:2375"
     networks:
       - mini-cloud-network
     restart: unless-stopped
@@ -79,16 +79,16 @@ services:
 
   watchtower:
     image: containrrr/watchtower
-    restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /var/lib/watchtower:/var/lib/watchtower  # ✅ FIXED: State persistence
+      - /var/lib/watchtower:/var/lib/watchtower
     command: 
-      - --cleanup 
+      - --cleanup
       - --interval 3600
       - --label-enable
     networks:
       - mini-cloud-network
+    restart: unless-stopped
 
 networks:
   mini-cloud-network:
