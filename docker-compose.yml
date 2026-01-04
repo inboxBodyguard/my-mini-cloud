@@ -2,88 +2,145 @@ version: '3.8'
 
 services:
   platform:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: mini-cloud-platform
     ports:
       - "8000:8000"
     volumes:
-      - app-/app/data
-      - dashboard-/app/dashboard
-      - ./config:/app/config  # ✅ Config files instead of docker socket
+      - app-data:/app/data
+      - dashboard-data:/app/dashboard
+      - ./config:/app/config:ro  # Read-only config files
+      - ./logs:/app/logs  # Application logs
     environment:
       - PLATFORM_DOMAIN=${PLATFORM_DOMAIN}
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
       - SECRET_KEY=${SECRET_KEY}
-      - DOCKER_HOST=tcp://docker-socket:2375  # ✅ Use TCP instead of socket
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
     depends_on:
-      - postgres
-      - docker-socket
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - mini-cloud-network
     restart: unless-stopped
-
-  docker-socket:  # ✅ Secure Docker socket proxy
-    image: tecnativa/docker-socket-proxy
-    environment:
-      - CONTAINERS=1
-      - IMAGES=1
-      - AUTH=1
-      - POST=0  # Disable container creation from API
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
-    networks:
-      - mini-cloud-network
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.platform.rule=Host(`${PLATFORM_DOMAIN}`)"
+      - "traefik.http.routers.platform.entrypoints=websecure"
+      - "traefik.http.routers.platform.tls.certresolver=myresolver"
+      - "traefik.http.services.platform.loadbalancer.server.port=8000"
+      # Redirect HTTP to HTTPS
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.routers.platform-http.rule=Host(`${PLATFORM_DOMAIN}`)"
+      - "traefik.http.routers.platform-http.entrypoints=web"
+      - "traefik.http.routers.platform-http.middlewares=redirect-to-https"
 
   traefik:
-    image: traefik:v2.10
+    image: traefik:v2.11
+    container_name: traefik-proxy
     command:
       - --api.dashboard=true
-      - --api.insecure=false  # ✅ Secure API
+      - --api.insecure=false
       - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=mini-cloud-network
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}
       - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web
-      - --providers.docker.exposedbydefault=false  # ✅ Only expose labeled containers
+      - --log.level=INFO
+      - --accesslog=true
+      - --accesslog.filepath=/logs/access.log
     ports:
       - "80:80"
       - "443:443"
+      - "8080:8080"  # Traefik dashboard (protect this!)
     volumes:
-      - ./config/traefik:/etc/traefik  # ✅ Config files
       - ./letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
+      - ./logs/traefik:/logs
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - mini-cloud-network
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      # Traefik dashboard
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${PLATFORM_DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=myresolver"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      # Basic auth for dashboard (generate with: htpasswd -nb admin password)
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=${TRAEFIK_AUTH}"
 
   postgres:
     image: postgres:15-alpine
+    container_name: mini-cloud-postgres
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - postgres_/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
       - ./backups:/backups
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro  # Init scripts if needed
     networks:
       - mini-cloud-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
+    shm_size: 256mb  # Increase shared memory for better performance
+
+  redis:
+    image: redis:7-alpine
+    container_name: mini-cloud-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redis-data:/data
+    networks:
+      - mini-cloud-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   watchtower:
-    image: containrrr/watchtower
+    image: containrrr/watchtower:latest
+    container_name: watchtower
     restart: unless-stopped
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # ✅ Read-only
-    command: 
-      - --cleanup 
-      - --interval 3600  # ✅ Check every hour, not every 5 minutes
-      - --label-enable  # ✅ Only update containers with watchtower label
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=3600  # Check every hour
+      - WATCHTOWER_ROLLING_RESTART=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      - WATCHTOWER_REVIVE_STOPPED=false
+      - WATCHTOWER_NOTIFICATION_URL=${WATCHTOWER_NOTIFICATION_URL:-}  # Optional: Slack/Discord webhook
+      - TZ=UTC
     networks:
       - mini-cloud-network
 
@@ -91,10 +148,17 @@ networks:
   mini-cloud-network:
     driver: bridge
     ipam:
+      driver: default
       config:
-        - subnet: 172.20.0.0/16  # ✅ Private subnet
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
 
 volumes:
-  postgres_
-  app-
-  dashboard-
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  app-data:
+    driver: local
+  dashboard-data:
+    driver: local
