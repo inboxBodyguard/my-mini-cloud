@@ -13,6 +13,8 @@ services:
       - dashboard-data:/app/dashboard
       - ./config:/app/config:ro  # Read-only config files
       - ./logs:/app/logs  # Application logs
+      - /var/run/docker.sock:/var/run/docker.sock
+
     environment:
       - PLATFORM_DOMAIN=${PLATFORM_DOMAIN}
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
