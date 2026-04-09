@@ -372,7 +372,7 @@ MIT License - see LICENSE file for details
 
 - **Issues**: [GitHub Issues](https://github.com/imboxBodyguard/mini-cloud-platform/issues)
 - **Docs**: [Full Documentation](https://docs.your-domain.com)
-- **Discord**: [Community Server](https://discord.gg/yourserver)
+- **Discord**: [Community Server](https://discord.gg/ctE9pmBut)
 
 ## 🎯 Roadmap
 
