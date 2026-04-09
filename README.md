@@ -1,6 +1,6 @@
 # Mini Cloud Platform 🚀
 
-A lightweight, self-hosted PaaS that lets you deploy web applications from Git repositories with automatic SSL, reverse proxy, and container orchestration.
+A lightweight, self-hosted playform that lets you deploy web applications from Git repositories with automatic SSL, reverse proxy, and container orchestration.
 
 ## 🎯 What It Does
 
